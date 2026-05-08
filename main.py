@@ -1,4 +1,5 @@
 import math
+import os
 import queue
 import re
 import shutil
@@ -11,12 +12,30 @@ from tkinter import BooleanVar, filedialog, messagebox
 import customtkinter as ctk
 
 
-APP_TITLE = "Video Scene Cutter"
-CUT_BY_DURATION = "Cắt theo thời lượng"
-CUT_BY_SCENE_FAST = "Cắt theo chuyển cảnh nhanh"
-CUT_BY_SCENE_ACCURATE = "Cắt theo chuyển cảnh chính xác"
-SCENE_CUT_TYPES = {CUT_BY_SCENE_FAST, CUT_BY_SCENE_ACCURATE}
-MIN_BOUNDARY_GAP = 0.01
+APP_TITLE = "Video Auto Cut by Lực Nguyễn"
+CUT_FIXED = "Cố định"
+CUT_BY_SCENE = "Chuyển cảnh"
+SMOOTH_TRIM_TAIL = "Cắt đuôi (Video trước)"
+SMOOTH_TRIM_HEAD = "Cắt đầu (Video sau)"
+MIN_BOUNDARY_GAP = 0.05
+
+BG_COLOR = "#f6f7f9"
+SECTION_COLOR = "#ffffff"
+SECTION_BORDER_COLOR = "#e5e7eb"
+TEXT_COLOR = "#1f2937"
+MUTED_TEXT_COLOR = "#374151"
+PRIMARY_COLOR = "#2f6fed"
+PRIMARY_HOVER_COLOR = "#255fd2"
+SUCCESS_COLOR = "#22a06b"
+SUCCESS_HOVER_COLOR = "#1b8758"
+CANCEL_COLOR = "#6b7280"
+CANCEL_HOVER_COLOR = "#b94a48"
+LOG_BG_COLOR = "#111827"
+LOG_TEXT_COLOR = "#e5e7eb"
+
+
+class ProcessingCancelled(Exception):
+    pass
 
 
 def safe_filename(name: str) -> str:
@@ -61,7 +80,12 @@ def run_ffmpeg_segment(
     command: list[str],
     duration: float,
     progress_callback,
+    cancel_event: threading.Event | None = None,
+    process_callback=None,
 ):
+    if cancel_event is not None and cancel_event.is_set():
+        raise ProcessingCancelled("Đã hủy xử lý.")
+
     process = subprocess.Popen(
         command,
         stdout=subprocess.PIPE,
@@ -70,6 +94,9 @@ def run_ffmpeg_segment(
         encoding="utf-8",
         errors="replace",
     )
+
+    if process_callback is not None:
+        process_callback(process)
 
     stderr_lines = []
 
@@ -84,8 +111,16 @@ def run_ffmpeg_segment(
     stderr_thread.start()
 
     try:
+        cancel_requested = False
+
         if process.stdout is not None:
             for raw_line in process.stdout:
+                if cancel_event is not None and cancel_event.is_set():
+                    cancel_requested = True
+                    if process.poll() is None:
+                        process.terminate()
+                    break
+
                 line = raw_line.strip()
                 elapsed = None
 
@@ -101,13 +136,32 @@ def run_ffmpeg_segment(
                 if elapsed is not None and duration > 0:
                     progress_callback(max(0, min(elapsed / duration, 1)))
 
-        return_code = process.wait()
+        if cancel_event is not None and cancel_event.is_set():
+            cancel_requested = True
+
+        if cancel_requested and process.poll() is None:
+            process.terminate()
+
+        try:
+            return_code = process.wait(timeout=5 if cancel_requested else None)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            return_code = process.wait()
+
         stderr_thread.join(timeout=2)
 
     except Exception:
-        process.kill()
+        if process.poll() is None:
+            process.kill()
         stderr_thread.join(timeout=2)
         raise
+
+    finally:
+        if process_callback is not None:
+            process_callback(None)
+
+    if cancel_event is not None and cancel_event.is_set():
+        raise ProcessingCancelled("Đã hủy xử lý.")
 
     if return_code != 0:
         raise subprocess.CalledProcessError(
@@ -155,7 +209,12 @@ def detect_scene_changes(
     video_path: Path,
     ffmpeg_path: str,
     threshold: float,
+    cancel_event: threading.Event | None = None,
+    process_callback=None,
 ) -> list[float]:
+    if cancel_event is not None and cancel_event.is_set():
+        raise ProcessingCancelled("Đã hủy xử lý.")
+
     command = [
         ffmpeg_path,
         "-hide_banner",
@@ -169,18 +228,38 @@ def detect_scene_changes(
         "-",
     ]
 
-    result = subprocess.run(
+    process = subprocess.Popen(
         command,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
-        check=True,
         encoding="utf-8",
         errors="replace",
     )
 
+    if process_callback is not None:
+        process_callback(process)
+
+    try:
+        _, stderr = process.communicate()
+    finally:
+        if process_callback is not None:
+            process_callback(None)
+
+    if cancel_event is not None and cancel_event.is_set():
+        if process.poll() is None:
+            process.terminate()
+        raise ProcessingCancelled("Đã hủy xử lý.")
+
+    if process.returncode != 0:
+        raise subprocess.CalledProcessError(
+            process.returncode,
+            command,
+            stderr=stderr,
+        )
+
     scene_times = []
-    for match in re.finditer(r"pts_time:([0-9]+(?:\.[0-9]+)?)", result.stderr):
+    for match in re.finditer(r"pts_time:([0-9]+(?:\.[0-9]+)?)", stderr):
         scene_times.append(float(match.group(1)))
 
     return sorted(set(scene_times))
@@ -242,6 +321,7 @@ def build_smooth_boundary_times(
     split_times: list[float],
     duration: float,
     smooth_seconds: float,
+    smooth_mode: str,
 ) -> tuple[list[float], list[tuple[float, float, float]]]:
     if smooth_seconds <= 0:
         return [], []
@@ -251,8 +331,12 @@ def build_smooth_boundary_times(
     last_boundary_time = 0.0
 
     for split_time in normalize_split_times(split_times, duration):
-        left = round(split_time - smooth_seconds, 3)
-        right = round(split_time + smooth_seconds, 3)
+        if smooth_mode == SMOOTH_TRIM_HEAD:
+            left = round(split_time, 3)
+            right = round(split_time + smooth_seconds, 3)
+        else:
+            left = round(split_time - smooth_seconds, 3)
+            right = round(split_time, 3)
 
         if left <= 0 or right >= duration or right <= left:
             continue
@@ -280,297 +364,494 @@ def format_split_times(split_times: list[float]) -> str:
     return ",".join(formatted_times)
 
 
+def on_off(value: bool) -> str:
+    return "ON" if value else "OFF"
+
+
 class VideoCutterApp(ctk.CTk):
     def __init__(self):
         super().__init__()
 
         self.title(APP_TITLE)
-        self.geometry("820x620")
-        self.minsize(760, 560)
+        self.geometry("940x760")
+        self.minsize(860, 700)
 
-        ctk.set_appearance_mode("System")
+        ctk.set_appearance_mode("Light")
         ctk.set_default_color_theme("blue")
+        self.configure(fg_color=BG_COLOR)
+        self.load_window_icon()
 
         self.video_path_var = ctk.StringVar()
         self.output_dir_var = ctk.StringVar()
+        self.cut_type_var = ctk.StringVar(value=CUT_FIXED)
         self.seconds_var = ctk.StringVar(value="3")
-        self.mode_var = ctk.StringVar(value="Tách cả cảnh lẻ và cảnh chẵn")
-        self.cut_type_var = ctk.StringVar(value=CUT_BY_DURATION)
         self.min_seconds_var = ctk.StringVar(value="2")
         self.max_seconds_var = ctk.StringVar(value="5")
         self.scene_threshold_var = ctk.StringVar(value="0.35")
+        self.output_folder_count_var = ctk.StringVar(value="1")
+        self.remove_audio_var = BooleanVar(value=False)
         self.smooth_enabled_var = BooleanVar(value=False)
-        self.smooth_seconds_var = ctk.StringVar(value="0.1")
+        self.smooth_seconds_var = ctk.StringVar(value="0.5")
+        self.smooth_mode_var = ctk.StringVar(value=SMOOTH_TRIM_TAIL)
 
         self.log_queue = queue.Queue()
         self.worker_thread = None
+        self.cancel_event = threading.Event()
+        self.current_process = None
+        self.process_lock = threading.Lock()
+        self.current_output_dir = None
+        self.last_output_dir = None
 
         self.build_ui()
         self.after(100, self.process_log_queue)
 
-    def build_ui(self):
-        main_frame = ctk.CTkFrame(self)
-        main_frame.pack(fill="both", expand=True, padx=16, pady=16)
+    def load_window_icon(self):
+        app_dir = Path(__file__).resolve().parent
+        icon_path = app_dir / "icon_scissors.ico"
 
-        title_label = ctk.CTkLabel(
-            main_frame,
-            text="Video Scene Cutter",
-            font=ctk.CTkFont(size=24, weight="bold"),
+        if not icon_path.exists():
+            return
+
+        try:
+            self.iconbitmap(str(icon_path))
+        except Exception:
+            return
+
+    def create_section_frame(self, parent):
+        section = ctk.CTkFrame(
+            parent,
+            fg_color=SECTION_COLOR,
+            border_width=1,
+            border_color=SECTION_BORDER_COLOR,
+            corner_radius=10,
         )
-        title_label.pack(anchor="w", padx=16, pady=(16, 8))
+        section.pack(fill="x", pady=(0, 8))
+        return section
 
-        desc_label = ctk.CTkLabel(
-            main_frame,
-            text="Cắt video theo số giây mong muốn, tự động đánh số cảnh và tách cảnh lẻ/chẵn.",
-            font=ctk.CTkFont(size=14),
-        )
-        desc_label.pack(anchor="w", padx=16, pady=(0, 16))
-
-        # Video input
-        video_row = ctk.CTkFrame(main_frame)
-        video_row.pack(fill="x", padx=16, pady=8)
-
-        ctk.CTkLabel(video_row, text="Video đầu vào:", width=120).pack(
-            side="left", padx=(8, 6)
-        )
-
-        video_entry = ctk.CTkEntry(video_row, textvariable=self.video_path_var)
-        video_entry.pack(side="left", fill="x", expand=True, padx=6)
-
-        ctk.CTkButton(
-            video_row,
-            text="Chọn video",
-            width=120,
-            command=self.choose_video,
-        ).pack(side="left", padx=(6, 8))
-
-        # Output folder
-        output_row = ctk.CTkFrame(main_frame)
-        output_row.pack(fill="x", padx=16, pady=8)
-
-        ctk.CTkLabel(output_row, text="Thư mục xuất:", width=120).pack(
-            side="left", padx=(8, 6)
-        )
-
-        output_entry = ctk.CTkEntry(output_row, textvariable=self.output_dir_var)
-        output_entry.pack(side="left", fill="x", expand=True, padx=6)
-
-        ctk.CTkButton(
-            output_row,
-            text="Chọn thư mục",
-            width=120,
-            command=self.choose_output_dir,
-        ).pack(side="left", padx=(6, 8))
-
-        # Cut settings
-        cut_type_row = ctk.CTkFrame(main_frame)
-        cut_type_row.pack(fill="x", padx=16, pady=8)
-
-        ctk.CTkLabel(cut_type_row, text="Kiểu cắt:", width=140).pack(
-            side="left", padx=(8, 6)
-        )
-
-        cut_type_menu = ctk.CTkOptionMenu(
-            cut_type_row,
-            variable=self.cut_type_var,
-            values=[
-                CUT_BY_DURATION,
-                CUT_BY_SCENE_FAST,
-                CUT_BY_SCENE_ACCURATE,
-            ],
-            command=self.update_cut_mode_ui,
-            width=240,
-        )
-        cut_type_menu.pack(side="left", padx=6)
-
-        accuracy_note = ctk.CTkLabel(
-            main_frame,
-            text=(
-                "Cắt theo thời lượng dùng -c copy nhanh nhất. "
-                "Chuyển cảnh nhanh dùng -c copy; chuyển cảnh chính xác encode lại."
-            ),
-            font=ctk.CTkFont(size=12),
-        )
-        accuracy_note.pack(anchor="w", padx=16, pady=(0, 4))
-
-        self.duration_settings_row = ctk.CTkFrame(main_frame)
-        self.duration_settings_row.pack(fill="x", padx=16, pady=8)
+    def create_field_row(self, parent, label_text: str, label_width: int = 130):
+        row = ctk.CTkFrame(parent, fg_color="transparent")
+        row.pack(fill="x", padx=14, pady=6)
 
         ctk.CTkLabel(
-            self.duration_settings_row,
-            text="Số giây mỗi cảnh:",
-            width=140,
-        ).pack(side="left", padx=(8, 6))
+            row,
+            text=label_text,
+            width=label_width,
+            anchor="w",
+            text_color=MUTED_TEXT_COLOR,
+            font=ctk.CTkFont(size=13),
+        ).pack(side="left", padx=(0, 10))
 
+        return row
+
+    def style_entry(self, entry):
+        entry.configure(
+            height=32,
+            fg_color="#ffffff",
+            border_color="#d1d5db",
+            text_color=TEXT_COLOR,
+            placeholder_text_color="#94a3b8",
+            font=ctk.CTkFont(size=13),
+            corner_radius=7,
+        )
+
+    def style_option_menu(self, menu):
+        menu.configure(
+            height=32,
+            fg_color="#ffffff",
+            button_color="#e5e7eb",
+            button_hover_color="#d1d5db",
+            text_color=TEXT_COLOR,
+            font=ctk.CTkFont(size=13),
+            dropdown_font=ctk.CTkFont(size=13),
+            dropdown_fg_color="#ffffff",
+            dropdown_hover_color="#eef2ff",
+            dropdown_text_color=TEXT_COLOR,
+            corner_radius=7,
+            dynamic_resizing=False,
+        )
+
+    def style_primary_option_menu(self, menu):
+        menu.configure(
+            height=34,
+            fg_color=PRIMARY_COLOR,
+            button_color=PRIMARY_COLOR,
+            button_hover_color=PRIMARY_HOVER_COLOR,
+            text_color="#ffffff",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            dropdown_font=ctk.CTkFont(size=13),
+            dropdown_fg_color="#ffffff",
+            dropdown_hover_color="#dbeafe",
+            dropdown_text_color=TEXT_COLOR,
+            corner_radius=8,
+            dynamic_resizing=False,
+        )
+
+    def create_path_section(
+        self,
+        parent,
+        row_label: str,
+        variable,
+        placeholder: str,
+        button_text: str,
+        button_color: str,
+        button_hover_color: str,
+        command,
+    ):
+        section = self.create_section_frame(parent)
+
+        row = ctk.CTkFrame(section, fg_color="transparent")
+        row.pack(fill="x", padx=14, pady=10)
+
+        ctk.CTkLabel(
+            row,
+            text=row_label,
+            width=130,
+            anchor="w",
+            text_color=MUTED_TEXT_COLOR,
+            font=ctk.CTkFont(size=13),
+        ).pack(side="left", padx=(0, 10))
+
+        entry = ctk.CTkEntry(
+            row,
+            textvariable=variable,
+            placeholder_text=placeholder,
+        )
+        self.style_entry(entry)
+        entry.pack(side="left", fill="x", expand=True, padx=(0, 12))
+
+        ctk.CTkButton(
+            row,
+            text=button_text,
+            width=120,
+            height=32,
+            fg_color=button_color,
+            hover_color=button_hover_color,
+            font=ctk.CTkFont(size=13),
+            corner_radius=7,
+            command=command,
+        ).pack(side="left")
+
+        return section
+
+    def build_ui(self):
+        main_frame = ctk.CTkFrame(self, fg_color=BG_COLOR, corner_radius=0)
+        main_frame.pack(fill="both", expand=True, padx=14, pady=12)
+
+        title_section = ctk.CTkFrame(main_frame, fg_color=BG_COLOR, corner_radius=0)
+        title_section.pack(fill="x", pady=(2, 10))
+
+        ctk.CTkLabel(
+            title_section,
+            text=APP_TITLE,
+            anchor="center",
+            justify="center",
+            text_color=TEXT_COLOR,
+            font=ctk.CTkFont(size=22, weight="bold"),
+        ).pack(fill="x")
+
+        self.create_path_section(
+            main_frame,
+            "Video đầu vào:",
+            self.video_path_var,
+            "Chưa chọn video...",
+            "Chọn video",
+            PRIMARY_COLOR,
+            PRIMARY_HOVER_COLOR,
+            self.choose_video,
+        )
+
+        self.create_path_section(
+            main_frame,
+            "Thư mục xuất:",
+            self.output_dir_var,
+            "Chưa chọn thư mục...",
+            "Chọn thư mục",
+            SUCCESS_COLOR,
+            SUCCESS_HOVER_COLOR,
+            self.choose_output_dir,
+        )
+
+        settings_section = self.create_section_frame(main_frame)
+
+        cut_type_row = self.create_field_row(settings_section, "Kiểu cắt:")
+        self.cut_type_menu = ctk.CTkOptionMenu(
+            cut_type_row,
+            variable=self.cut_type_var,
+            values=[CUT_FIXED, CUT_BY_SCENE],
+            command=self.update_cut_mode_ui,
+            width=250,
+        )
+        self.style_primary_option_menu(self.cut_type_menu)
+        self.cut_type_menu.pack(side="left")
+
+        self.duration_settings_row = self.create_field_row(
+            settings_section,
+            "Thời lượng (s):",
+        )
         self.seconds_entry = ctk.CTkEntry(
             self.duration_settings_row,
             textvariable=self.seconds_var,
             width=100,
         )
-        self.seconds_entry.pack(side="left", padx=6)
+        self.style_entry(self.seconds_entry)
+        self.seconds_entry.pack(side="left")
 
-        self.scene_settings_row = ctk.CTkFrame(main_frame)
-        self.scene_settings_row.pack(fill="x", padx=16, pady=8)
-
-        ctk.CTkLabel(
-            self.scene_settings_row,
-            text="Min clip seconds:",
-            width=140,
-        ).pack(side="left", padx=(8, 6))
+        self.scene_settings_row = self.create_field_row(settings_section, "Min (s):")
 
         self.min_seconds_entry = ctk.CTkEntry(
             self.scene_settings_row,
             textvariable=self.min_seconds_var,
-            width=70,
+            width=86,
         )
-        self.min_seconds_entry.pack(side="left", padx=6)
+        self.style_entry(self.min_seconds_entry)
+        self.min_seconds_entry.pack(side="left", padx=(0, 18))
 
         ctk.CTkLabel(
             self.scene_settings_row,
-            text="Max clip seconds:",
-            width=130,
-        ).pack(side="left", padx=(18, 6))
-
+            text="Max (s):",
+            text_color=MUTED_TEXT_COLOR,
+        ).pack(side="left", padx=(0, 8))
         self.max_seconds_entry = ctk.CTkEntry(
             self.scene_settings_row,
             textvariable=self.max_seconds_var,
-            width=70,
+            width=86,
         )
-        self.max_seconds_entry.pack(side="left", padx=6)
+        self.style_entry(self.max_seconds_entry)
+        self.max_seconds_entry.pack(side="left", padx=(0, 18))
 
         ctk.CTkLabel(
             self.scene_settings_row,
             text="Scene threshold:",
-            width=120,
-        ).pack(side="left", padx=(18, 6))
-
+            text_color=MUTED_TEXT_COLOR,
+        ).pack(side="left", padx=(0, 8))
         self.scene_threshold_entry = ctk.CTkEntry(
             self.scene_settings_row,
             textvariable=self.scene_threshold_var,
-            width=70,
+            width=86,
         )
-        self.scene_threshold_entry.pack(side="left", padx=6)
+        self.style_entry(self.scene_threshold_entry)
+        self.scene_threshold_entry.pack(side="left")
 
-        self.smooth_row = ctk.CTkFrame(main_frame)
-        self.smooth_row.pack(fill="x", padx=16, pady=8)
-
+        self.smooth_row = self.create_field_row(settings_section, "Làm mượt:")
         self.smooth_switch = ctk.CTkSwitch(
             self.smooth_row,
-            text="Làm mượt",
+            text="",
             variable=self.smooth_enabled_var,
-            command=self.update_cut_mode_ui,
+            command=self.update_smooth_ui,
+            width=70,
+            progress_color=PRIMARY_COLOR,
         )
-        self.smooth_switch.pack(side="left", padx=(8, 6))
+        self.smooth_switch.pack(side="left")
 
-        self.smooth_seconds_row = ctk.CTkFrame(main_frame)
-        self.smooth_seconds_row.pack(fill="x", padx=16, pady=8)
-
-        ctk.CTkLabel(
-            self.smooth_seconds_row,
-            text="Vùng làm mượt quanh điểm cắt (giây):",
-            width=260,
-        ).pack(side="left", padx=(8, 6))
+        self.smooth_settings_frame = ctk.CTkFrame(
+            self.smooth_row,
+            fg_color="transparent",
+        )
+        self.smooth_settings_frame.pack(side="left", padx=(14, 0))
 
         self.smooth_seconds_entry = ctk.CTkEntry(
-            self.smooth_seconds_row,
+            self.smooth_settings_frame,
             textvariable=self.smooth_seconds_var,
-            width=80,
+            width=86,
         )
-        self.smooth_seconds_entry.pack(side="left", padx=6)
+        self.style_entry(self.smooth_seconds_entry)
+        self.smooth_seconds_entry.pack(side="left", padx=(0, 8))
 
-        self.mode_row = ctk.CTkFrame(main_frame)
-        self.mode_row.pack(fill="x", padx=16, pady=8)
+        ctk.CTkLabel(
+            self.smooth_settings_frame,
+            text="giây",
+            text_color=MUTED_TEXT_COLOR,
+        ).pack(side="left", padx=(0, 12))
 
-        ctk.CTkLabel(self.mode_row, text="Chế độ xuất:", width=140).pack(
-            side="left", padx=(8, 6)
+        self.smooth_mode_menu = ctk.CTkOptionMenu(
+            self.smooth_settings_frame,
+            variable=self.smooth_mode_var,
+            values=[SMOOTH_TRIM_TAIL, SMOOTH_TRIM_HEAD],
+            width=210,
         )
+        self.style_option_menu(self.smooth_mode_menu)
+        self.smooth_mode_menu.pack(side="left")
 
-        mode_menu = ctk.CTkOptionMenu(
-            self.mode_row,
-            variable=self.mode_var,
-            values=[
-                "Tách cả cảnh lẻ và cảnh chẵn",
-                "Chỉ lấy cảnh lẻ",
-                "Chỉ lấy cảnh chẵn",
-            ],
-            width=240,
+        output_section = self.create_section_frame(main_frame)
+
+        self.output_options_row = self.create_field_row(output_section, "Output:")
+        self.output_folder_count_entry = ctk.CTkEntry(
+            self.output_options_row,
+            textvariable=self.output_folder_count_var,
+            width=86,
         )
-        mode_menu.pack(side="left", padx=6)
-        self.update_cut_mode_ui()
+        self.style_entry(self.output_folder_count_entry)
+        self.output_folder_count_entry.pack(side="left", padx=(0, 8))
 
-        # Buttons
-        button_row = ctk.CTkFrame(main_frame)
-        button_row.pack(fill="x", padx=16, pady=12)
+        ctk.CTkLabel(
+            self.output_options_row,
+            text="folder",
+            text_color=MUTED_TEXT_COLOR,
+        ).pack(side="left", padx=(0, 50))
+
+        ctk.CTkLabel(
+            self.output_options_row,
+            text="Xóa audio:",
+            text_color=MUTED_TEXT_COLOR,
+            font=ctk.CTkFont(size=13),
+        ).pack(side="left", padx=(0, 10))
+
+        self.remove_audio_switch = ctk.CTkSwitch(
+            self.output_options_row,
+            text="",
+            variable=self.remove_audio_var,
+            width=54,
+            switch_width=46,
+            switch_height=22,
+            fg_color="#d1d5db",
+            progress_color=PRIMARY_COLOR,
+            button_color="#ffffff",
+            button_hover_color="#f3f4f6",
+        )
+        self.remove_audio_switch.pack(side="left")
+
+        control_section = self.create_section_frame(main_frame)
+
+        button_row = ctk.CTkFrame(control_section, fg_color="transparent")
+        button_row.pack(fill="x", padx=14, pady=(10, 8))
 
         self.start_button = ctk.CTkButton(
             button_row,
-            text="Bắt đầu cắt video",
-            height=40,
+            text="Bắt đầu",
+            width=112,
+            height=34,
+            fg_color=PRIMARY_COLOR,
+            hover_color=PRIMARY_HOVER_COLOR,
+            font=ctk.CTkFont(size=13, weight="bold"),
+            corner_radius=7,
             command=self.start_processing,
         )
-        self.start_button.pack(side="left", padx=8)
+        self.start_button.pack(side="left", padx=(0, 12))
 
-        self.progress_bar = ctk.CTkProgressBar(button_row)
-        self.progress_bar.pack(side="left", fill="x", expand=True, padx=12)
+        self.cancel_button = ctk.CTkButton(
+            button_row,
+            text="Hủy",
+            width=86,
+            height=34,
+            fg_color=CANCEL_COLOR,
+            hover_color=CANCEL_HOVER_COLOR,
+            font=ctk.CTkFont(size=13),
+            corner_radius=7,
+            state="disabled",
+            command=self.cancel_processing,
+        )
+        self.cancel_button.pack(side="left")
+
+        self.open_output_button = ctk.CTkButton(
+            button_row,
+            text="Mở thư mục kết quả",
+            width=160,
+            height=34,
+            fg_color="#4b5563",
+            hover_color="#374151",
+            font=ctk.CTkFont(size=13),
+            corner_radius=7,
+            state="disabled",
+            command=self.open_last_output_dir,
+        )
+        self.open_output_button.pack(side="left", padx=(12, 0))
+
+        progress_row = ctk.CTkFrame(control_section, fg_color="transparent")
+        progress_row.pack(fill="x", padx=14, pady=(0, 10))
+
+        ctk.CTkLabel(
+            progress_row,
+            text="Tiến trình:",
+            width=130,
+            anchor="w",
+            text_color=MUTED_TEXT_COLOR,
+            font=ctk.CTkFont(size=13),
+        ).pack(side="left", padx=(0, 12))
+
+        self.progress_bar = ctk.CTkProgressBar(
+            progress_row,
+            progress_color=PRIMARY_COLOR,
+            fg_color="#dbeafe",
+            height=12,
+        )
+        self.progress_bar.pack(side="left", fill="x", expand=True, padx=(0, 12))
         self.progress_bar.set(0)
 
-        self.progress_label = ctk.CTkLabel(button_row, text="0%")
-        self.progress_label.pack(side="left", padx=8)
-
-        # Log
-        log_label = ctk.CTkLabel(
-            main_frame,
-            text="Nhật ký xử lý:",
-            font=ctk.CTkFont(size=15, weight="bold"),
+        self.progress_label = ctk.CTkLabel(
+            progress_row,
+            text="0%",
+            width=54,
+            anchor="e",
+            text_color=TEXT_COLOR,
+            font=ctk.CTkFont(size=13, weight="normal"),
         )
-        log_label.pack(anchor="w", padx=16, pady=(8, 4))
+        self.progress_label.pack(side="left")
 
-        self.log_box = ctk.CTkTextbox(main_frame, height=260)
-        self.log_box.pack(fill="both", expand=True, padx=16, pady=(0, 16))
+        log_section = ctk.CTkFrame(
+            main_frame,
+            fg_color=SECTION_COLOR,
+            border_width=1,
+            border_color=SECTION_BORDER_COLOR,
+            corner_radius=10,
+        )
+        log_section.pack(fill="both", expand=True)
+
+        ctk.CTkLabel(
+            log_section,
+            text="Nhật ký xử lý:",
+            anchor="w",
+            text_color=MUTED_TEXT_COLOR,
+            font=ctk.CTkFont(size=13),
+        ).pack(fill="x", padx=14, pady=(10, 4))
+
+        self.log_box = ctk.CTkTextbox(
+            log_section,
+            height=210,
+            fg_color=LOG_BG_COLOR,
+            text_color=LOG_TEXT_COLOR,
+            border_width=1,
+            border_color="#1f2937",
+            corner_radius=8,
+            font=ctk.CTkFont(family="Consolas", size=12),
+        )
+        self.log_box.pack(fill="both", expand=True, padx=14, pady=(4, 14))
         self.log_box.configure(state="disabled")
 
+        self.update_cut_mode_ui()
+
+    def update_smooth_ui(self):
+        is_scene_cut = self.cut_type_var.get() == CUT_BY_SCENE
+        show_smooth_settings = is_scene_cut and self.smooth_enabled_var.get()
+
+        if show_smooth_settings:
+            if not self.smooth_settings_frame.winfo_manager():
+                self.smooth_settings_frame.pack(side="left", padx=(14, 0))
+            self.smooth_seconds_entry.configure(state="normal")
+            self.smooth_mode_menu.configure(state="normal")
+        else:
+            if self.smooth_settings_frame.winfo_manager():
+                self.smooth_settings_frame.pack_forget()
+            self.smooth_seconds_entry.configure(state="disabled")
+            self.smooth_mode_menu.configure(state="disabled")
+
     def update_cut_mode_ui(self, _=None):
-        is_scene_cut = self.cut_type_var.get() in SCENE_CUT_TYPES
+        is_scene_cut = self.cut_type_var.get() == CUT_BY_SCENE
 
         if is_scene_cut:
             if self.duration_settings_row.winfo_manager():
                 self.duration_settings_row.pack_forget()
 
             if not self.scene_settings_row.winfo_manager():
-                self.scene_settings_row.pack(
-                    fill="x",
-                    padx=16,
-                    pady=8,
-                    before=self.mode_row,
-                )
+                self.scene_settings_row.pack(fill="x", padx=18, pady=(8, 10))
 
             if not self.smooth_row.winfo_manager():
-                self.smooth_row.pack(
-                    fill="x",
-                    padx=16,
-                    pady=8,
-                    before=self.mode_row,
-                )
+                self.smooth_row.pack(fill="x", padx=18, pady=(8, 10))
 
-            if self.smooth_enabled_var.get():
-                if not self.smooth_seconds_row.winfo_manager():
-                    self.smooth_seconds_row.pack(
-                        fill="x",
-                        padx=16,
-                        pady=8,
-                        before=self.mode_row,
-                    )
-                self.smooth_seconds_entry.configure(state="normal")
-            else:
-                if self.smooth_seconds_row.winfo_manager():
-                    self.smooth_seconds_row.pack_forget()
-                self.smooth_seconds_entry.configure(state="disabled")
-
-            self.seconds_entry.configure(state="disabled")
             self.min_seconds_entry.configure(state="normal")
             self.max_seconds_entry.configure(state="normal")
             self.scene_threshold_entry.configure(state="normal")
             self.smooth_switch.configure(state="normal")
+
         else:
             if self.scene_settings_row.winfo_manager():
                 self.scene_settings_row.pack_forget()
@@ -578,23 +859,16 @@ class VideoCutterApp(ctk.CTk):
             if self.smooth_row.winfo_manager():
                 self.smooth_row.pack_forget()
 
-            if self.smooth_seconds_row.winfo_manager():
-                self.smooth_seconds_row.pack_forget()
-
             if not self.duration_settings_row.winfo_manager():
-                self.duration_settings_row.pack(
-                    fill="x",
-                    padx=16,
-                    pady=8,
-                    before=self.mode_row,
-                )
+                self.duration_settings_row.pack(fill="x", padx=18, pady=(8, 10))
 
             self.seconds_entry.configure(state="normal")
             self.min_seconds_entry.configure(state="disabled")
             self.max_seconds_entry.configure(state="disabled")
             self.scene_threshold_entry.configure(state="disabled")
             self.smooth_switch.configure(state="disabled")
-            self.smooth_seconds_entry.configure(state="disabled")
+
+        self.update_smooth_ui()
 
     def choose_video(self):
         file_path = filedialog.askopenfilename(
@@ -623,6 +897,68 @@ class VideoCutterApp(ctk.CTk):
     def set_progress(self, value: float):
         self.log_queue.put(("progress", value))
 
+    def set_current_process(self, process):
+        with self.process_lock:
+            self.current_process = process
+
+    def terminate_current_process(self):
+        with self.process_lock:
+            process = self.current_process
+
+        if process is not None and process.poll() is None:
+            try:
+                process.terminate()
+            except Exception:
+                return
+
+    def cancel_processing(self):
+        if not (self.worker_thread and self.worker_thread.is_alive()):
+            return
+
+        if not self.cancel_event.is_set():
+            self.cancel_event.set()
+            self.log("Đã yêu cầu hủy xử lý.")
+
+        self.cancel_button.configure(state="disabled")
+        self.terminate_current_process()
+
+    def check_cancelled(self):
+        if self.cancel_event.is_set():
+            raise ProcessingCancelled("Đã hủy xử lý.")
+
+    def cleanup_cancelled_output_dir(self):
+        output_dir = self.current_output_dir
+
+        if output_dir is None:
+            return
+
+        if not re.search(r"_cut_\d{8}_\d{6}$", output_dir.name):
+            self.log("Bỏ qua xóa dữ liệu tạm vì đường dẫn kết quả không hợp lệ.")
+            self.current_output_dir = None
+            return
+
+        try:
+            if self.current_output_dir.exists():
+                shutil.rmtree(self.current_output_dir, ignore_errors=True)
+                self.log("Đã xóa dữ liệu tạm của tiến trình bị hủy.")
+        finally:
+            if self.last_output_dir == output_dir:
+                self.last_output_dir = None
+            self.current_output_dir = None
+
+    def open_last_output_dir(self):
+        if self.last_output_dir is None or not self.last_output_dir.exists():
+            self.log("Chưa có thư mục kết quả để mở.")
+            self.open_output_button.configure(state="disabled")
+            return
+
+        try:
+            os.startfile(str(self.last_output_dir))
+        except Exception as error:
+            error_message = f"Không mở được thư mục kết quả: {error}"
+            self.log(error_message)
+            messagebox.showerror("Lỗi", error_message)
+
     def process_log_queue(self):
         try:
             while True:
@@ -640,11 +976,22 @@ class VideoCutterApp(ctk.CTk):
 
                 elif action == "done":
                     self.start_button.configure(state="normal")
+                    self.cancel_button.configure(state="disabled")
+                    if self.last_output_dir is not None and self.last_output_dir.exists():
+                        self.open_output_button.configure(state="normal")
                     messagebox.showinfo("Hoàn thành", str(value))
 
                 elif action == "error":
                     self.start_button.configure(state="normal")
+                    self.cancel_button.configure(state="disabled")
+                    self.open_output_button.configure(state="disabled")
                     messagebox.showerror("Lỗi", str(value))
+
+                elif action == "cancelled":
+                    self.start_button.configure(state="normal")
+                    self.cancel_button.configure(state="disabled")
+                    self.open_output_button.configure(state="disabled")
+                    messagebox.showinfo("Đã hủy", str(value))
 
         except queue.Empty:
             pass
@@ -652,15 +999,29 @@ class VideoCutterApp(ctk.CTk):
         self.after(100, self.process_log_queue)
 
     def validate_inputs(self):
-        video_path = Path(self.video_path_var.get().strip())
-        output_dir = Path(self.output_dir_var.get().strip())
+        video_path_text = self.video_path_var.get().strip()
+        output_dir_text = self.output_dir_var.get().strip()
         cut_type = self.cut_type_var.get()
 
+        if not video_path_text:
+            raise ValueError("Bạn chưa chọn video.")
+
+        video_path = Path(video_path_text)
         if not video_path.exists():
             raise ValueError("Bạn chưa chọn video hợp lệ.")
 
-        if not output_dir:
+        if not output_dir_text:
             raise ValueError("Bạn chưa chọn thư mục xuất file.")
+
+        output_dir = Path(output_dir_text)
+
+        try:
+            output_folder_count = int(self.output_folder_count_var.get().strip())
+        except ValueError:
+            raise ValueError("Output folder phải là số nguyên.")
+
+        if output_folder_count < 1:
+            raise ValueError("Output folder phải lớn hơn hoặc bằng 1.")
 
         segment_seconds = None
         min_seconds = None
@@ -668,31 +1029,30 @@ class VideoCutterApp(ctk.CTk):
         scene_threshold = None
         smooth_enabled = False
         smooth_seconds = 0.0
+        smooth_mode = self.smooth_mode_var.get()
 
-        if cut_type == CUT_BY_DURATION:
+        if cut_type == CUT_FIXED:
             try:
                 segment_seconds = float(self.seconds_var.get().strip())
             except ValueError:
-                raise ValueError("Số giây mỗi cảnh phải là số.")
+                raise ValueError("Thời lượng mỗi cảnh phải là số.")
 
             if segment_seconds <= 0:
-                raise ValueError("Số giây mỗi cảnh phải lớn hơn 0.")
+                raise ValueError("Thời lượng mỗi cảnh phải lớn hơn 0.")
 
-        elif cut_type in SCENE_CUT_TYPES:
+        elif cut_type == CUT_BY_SCENE:
             try:
                 min_seconds = float(self.min_seconds_var.get().strip())
                 max_seconds = float(self.max_seconds_var.get().strip())
                 scene_threshold = float(self.scene_threshold_var.get().strip())
             except ValueError:
-                raise ValueError(
-                    "Min clip seconds, Max clip seconds và Scene threshold phải là số."
-                )
+                raise ValueError("Min, Max và Scene threshold phải là số.")
 
             if min_seconds <= 0:
-                raise ValueError("Min clip seconds phải lớn hơn 0.")
+                raise ValueError("Min (s) phải lớn hơn 0.")
 
             if max_seconds <= min_seconds:
-                raise ValueError("Max clip seconds phải lớn hơn Min clip seconds.")
+                raise ValueError("Max (s) phải lớn hơn Min (s).")
 
             if not 0 < scene_threshold < 1:
                 raise ValueError("Scene threshold phải lớn hơn 0 và nhỏ hơn 1.")
@@ -703,10 +1063,13 @@ class VideoCutterApp(ctk.CTk):
                 try:
                     smooth_seconds = float(self.smooth_seconds_var.get().strip())
                 except ValueError:
-                    raise ValueError("Vùng làm mượt quanh điểm cắt phải là số.")
+                    raise ValueError("Số giây làm mượt phải là số.")
 
                 if smooth_seconds < 0:
-                    raise ValueError("Vùng làm mượt quanh điểm cắt phải lớn hơn hoặc bằng 0.")
+                    raise ValueError("Số giây làm mượt phải lớn hơn hoặc bằng 0.")
+
+                if smooth_mode not in [SMOOTH_TRIM_TAIL, SMOOTH_TRIM_HEAD]:
+                    raise ValueError("Kiểu làm mượt không hợp lệ.")
 
         else:
             raise ValueError("Kiểu cắt không hợp lệ.")
@@ -719,8 +1082,11 @@ class VideoCutterApp(ctk.CTk):
             min_seconds,
             max_seconds,
             scene_threshold,
+            output_folder_count,
+            bool(self.remove_audio_var.get()),
             smooth_enabled,
             smooth_seconds,
+            smooth_mode,
         )
 
     def start_processing(self):
@@ -737,14 +1103,24 @@ class VideoCutterApp(ctk.CTk):
                 min_seconds,
                 max_seconds,
                 scene_threshold,
+                output_folder_count,
+                remove_audio,
                 smooth_enabled,
                 smooth_seconds,
+                smooth_mode,
             ) = self.validate_inputs()
         except Exception as error:
             messagebox.showerror("Lỗi nhập liệu", str(error))
             return
 
+        self.cancel_event.clear()
+        self.set_current_process(None)
+        self.current_output_dir = None
+        self.last_output_dir = None
+
         self.start_button.configure(state="disabled")
+        self.cancel_button.configure(state="normal")
+        self.open_output_button.configure(state="disabled")
         self.progress_bar.set(0)
         self.progress_label.configure(text="0%")
 
@@ -752,191 +1128,305 @@ class VideoCutterApp(ctk.CTk):
         self.log_box.delete("1.0", "end")
         self.log_box.configure(state="disabled")
 
-        mode = self.mode_var.get()
-
         self.worker_thread = threading.Thread(
             target=self.process_video,
             args=(
                 video_path,
                 output_dir,
-                mode,
                 cut_type,
                 segment_seconds,
                 min_seconds,
                 max_seconds,
                 scene_threshold,
+                output_folder_count,
+                remove_audio,
                 smooth_enabled,
                 smooth_seconds,
+                smooth_mode,
             ),
             daemon=True,
         )
         self.worker_thread.start()
 
+    def build_fixed_segment_command(
+        self,
+        ffmpeg_path: str,
+        video_path: Path,
+        temp_pattern: Path,
+        segment_seconds: float,
+        remove_audio: bool,
+    ) -> list[str]:
+        command = [
+            ffmpeg_path,
+            "-y",
+            "-progress",
+            "pipe:1",
+            "-nostats",
+            "-i",
+            str(video_path),
+            "-map",
+            "0:v:0",
+        ]
+
+        if remove_audio:
+            command += [
+                "-an",
+                "-c:v",
+                "copy",
+            ]
+        else:
+            command += [
+                "-map",
+                "0:a?",
+                "-c",
+                "copy",
+            ]
+
+        command += [
+            "-f",
+            "segment",
+            "-segment_time",
+            str(segment_seconds),
+            "-reset_timestamps",
+            "1",
+            "-segment_start_number",
+            "1",
+            "-segment_format",
+            "mp4",
+            str(temp_pattern),
+        ]
+
+        return command
+
+    def build_scene_segment_command(
+        self,
+        ffmpeg_path: str,
+        video_path: Path,
+        temp_pattern: Path,
+        segment_times: list[float],
+        max_seconds: float,
+        duration: float,
+        remove_audio: bool,
+    ) -> list[str]:
+        command = [
+            ffmpeg_path,
+            "-y",
+            "-progress",
+            "pipe:1",
+            "-nostats",
+            "-i",
+            str(video_path),
+            "-map",
+            "0:v:0",
+        ]
+
+        if remove_audio:
+            command += ["-an"]
+        else:
+            command += ["-map", "0:a?"]
+
+        command += [
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-crf",
+            "23",
+        ]
+
+        if segment_times:
+            segment_times_text = format_split_times(segment_times)
+            command += ["-force_key_frames", segment_times_text]
+
+        if not remove_audio:
+            command += [
+                "-c:a",
+                "aac",
+                "-b:a",
+                "128k",
+            ]
+
+        command += ["-f", "segment"]
+
+        if segment_times:
+            command += [
+                "-segment_times",
+                format_split_times(segment_times),
+                "-segment_time_delta",
+                "0.05",
+            ]
+        else:
+            command += [
+                "-segment_time",
+                str(max(duration + 1, max_seconds)),
+            ]
+
+        command += [
+            "-reset_timestamps",
+            "1",
+            "-segment_start_number",
+            "1",
+            "-segment_format",
+            "mp4",
+            "-segment_format_options",
+            "movflags=+faststart",
+            str(temp_pattern),
+        ]
+
+        return command
+
+    def create_output_folders(
+        self,
+        project_output_dir: Path,
+        output_folder_count: int,
+    ) -> list[Path]:
+        folders = []
+
+        for folder_index in range(1, output_folder_count + 1):
+            folder = project_output_dir / f"folder_{folder_index}"
+            folder.mkdir(parents=True, exist_ok=True)
+            folders.append(folder)
+
+        return folders
+
     def process_video(
         self,
         video_path: Path,
         output_dir: Path,
-        mode: str,
         cut_type: str,
         segment_seconds: float | None,
         min_seconds: float | None,
         max_seconds: float | None,
         scene_threshold: float | None,
+        output_folder_count: int,
+        remove_audio: bool,
         smooth_enabled: bool,
         smooth_seconds: float,
+        smooth_mode: str,
     ):
         temp_dir = None
 
         try:
             ffmpeg_path, ffprobe_path = find_ffmpeg_tools()
+            self.check_cancelled()
 
             video_name = safe_filename(video_path.name)
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
             project_output_dir = output_dir / f"{video_name}_cut_{timestamp}"
             project_output_dir.mkdir(parents=True, exist_ok=True)
+            self.current_output_dir = project_output_dir
 
-            odd_dir = project_output_dir / "odd_scenes"
-            even_dir = project_output_dir / "even_scenes"
             temp_dir = project_output_dir / "temp_scenes"
             temp_dir.mkdir(parents=True, exist_ok=True)
 
-            if mode in ["Tách cả cảnh lẻ và cảnh chẵn", "Chỉ lấy cảnh lẻ"]:
-                odd_dir.mkdir(parents=True, exist_ok=True)
+            output_folders = self.create_output_folders(
+                project_output_dir,
+                output_folder_count,
+            )
 
-            if mode in ["Tách cả cảnh lẻ và cảnh chẵn", "Chỉ lấy cảnh chẵn"]:
-                even_dir.mkdir(parents=True, exist_ok=True)
-
-            self.log("Bat dau xu ly video.")
-            self.log(f"Video: {video_path}")
-            self.log(f"Thu muc xuat: {project_output_dir}")
-            self.log(f"Che do: {mode}")
-            self.log(f"Kieu cat: {cut_type}")
+            self.log("Bắt đầu xử lý video.")
+            self.log(f"Video đầu vào: {video_path}")
+            self.log(f"Thư mục xuất: {project_output_dir}")
+            self.log(f"Kiểu cắt: {cut_type}")
+            self.log(f"Output folder count: {output_folder_count}")
+            self.log(f"Xóa audio: {on_off(remove_audio)}")
 
             duration = get_video_duration(video_path, ffprobe_path)
-
-            self.log(f"Thoi luong video: {duration:.2f} giay")
+            self.check_cancelled()
+            self.log(f"Thời lượng video: {duration:.2f} giây")
 
             if duration <= 0:
-                raise RuntimeError("Video khong co thoi luong hop le.")
+                raise RuntimeError("Video không có thời lượng hợp lệ.")
 
             temp_pattern = temp_dir / "scene_%03d.mp4"
             discard_smooth_segments = False
-            base_command = [
-                ffmpeg_path,
-                "-y",
-                "-progress",
-                "pipe:1",
-                "-nostats",
-                "-i",
-                str(video_path),
+            dropped_smooth_segment_count = 0
+            segment_progress_start = 0.05
 
-                "-map",
-                "0:v:0",
-                "-map",
-                "0:a?",
-            ]
+            if cut_type == CUT_FIXED:
+                if segment_seconds is None:
+                    raise RuntimeError("Thiếu thời lượng cắt cố định.")
 
-            if cut_type == CUT_BY_DURATION:
-                self.log(
-                    "Che do cat theo thoi luong: dung -c copy, "
-                    "nhanh nhat, co the lech nhe theo keyframe."
+                expected_temp_segments = math.ceil(duration / segment_seconds)
+                total_scenes = expected_temp_segments
+
+                self.log(f"Thời lượng mỗi cảnh: {segment_seconds} giây")
+                self.log("Chế độ cố định dùng -c copy để xử lý nhanh.")
+
+                segment_command = self.build_fixed_segment_command(
+                    ffmpeg_path,
+                    video_path,
+                    temp_pattern,
+                    segment_seconds,
+                    remove_audio,
                 )
-                self.log(f"So giay moi canh: {segment_seconds}")
-                total_scenes = math.ceil(duration / segment_seconds)
-                expected_temp_segments = total_scenes
-                segment_progress_start = 0.05
-                self.log("Encoder dang dung: -c copy")
-                segment_command = base_command + [
-                    "-c",
-                    "copy",
-                    "-f",
-                    "segment",
-                    "-segment_time",
-                    str(segment_seconds),
-                    "-reset_timestamps",
-                    "1",
-                    "-segment_start_number",
-                    "1",
-                    "-segment_format",
-                    "mp4",
-                    str(temp_pattern),
-                ]
-            else:
-                if cut_type == CUT_BY_SCENE_FAST:
-                    self.log(
-                        "Che do chuyen canh nhanh: dung -c copy, "
-                        "co the lech nhe theo keyframe."
-                    )
-                    self.log("Encoder dang dung: -c copy")
-                else:
-                    self.log(
-                        "Che do chuyen canh chinh xac: "
-                        "encode lai de ep keyframe tai diem cat."
-                    )
-                    self.log("Encoder dang dung: libx264")
-                self.log(f"Min clip seconds: {min_seconds}")
-                self.log(f"Max clip seconds: {max_seconds}")
-                self.log(f"Threshold dang dung: {scene_threshold}")
-                self.log("Dang quet diem chuyen canh...")
+
+            elif cut_type == CUT_BY_SCENE:
+                if (
+                    min_seconds is None
+                    or max_seconds is None
+                    or scene_threshold is None
+                ):
+                    raise RuntimeError("Thiếu thông số cắt theo chuyển cảnh.")
+
+                self.log("Chế độ chuyển cảnh encode lại để ép keyframe và cắt chính xác hơn.")
+                self.log(f"Min seconds: {min_seconds}")
+                self.log(f"Max seconds: {max_seconds}")
+                self.log(f"Scene threshold: {scene_threshold}")
+                self.log(f"Làm mượt: {on_off(smooth_enabled)}")
+                self.log("Đang quét điểm chuyển cảnh...")
                 self.set_progress(0.02)
 
-                scene_times = detect_scene_changes(video_path, ffmpeg_path, scene_threshold)
+                scene_times = detect_scene_changes(
+                    video_path,
+                    ffmpeg_path,
+                    scene_threshold,
+                    self.cancel_event,
+                    self.set_current_process,
+                )
+                self.check_cancelled()
                 self.set_progress(0.10)
-                self.log(f"So diem chuyen canh phat hien duoc: {len(scene_times)}")
+                self.log(f"Số điểm chuyển cảnh phát hiện: {len(scene_times)}")
 
-                if scene_times:
-                    split_times = build_scene_split_times(
-                        scene_times,
-                        duration,
-                        min_seconds,
-                        max_seconds,
-                    )
-                else:
-                    self.log(
-                        "Khong phat hien duoc chuyen canh, "
-                        "fallback ve cat theo max seconds."
-                    )
-                    split_times = build_duration_split_times(duration, max_seconds)
-
+                split_times = build_scene_split_times(
+                    scene_times,
+                    duration,
+                    min_seconds,
+                    max_seconds,
+                )
                 split_times = normalize_split_times(split_times, duration)
-                self.log(f"So moc cat duoc tao ra: {len(split_times)}")
+                self.log(f"Số split_times tạo ra: {len(split_times)}")
 
                 segment_times = split_times
 
                 if smooth_enabled:
                     self.log(f"smooth_seconds: {smooth_seconds}")
+                    self.log(f"Kiểu làm mượt: {smooth_mode}")
 
-                    if smooth_seconds == 0:
-                        self.log("Lam muot = 0, xu ly nhu khong lam muot.")
-                    else:
-                        boundary_times, boundary_examples = build_smooth_boundary_times(
-                            split_times,
-                            duration,
-                            smooth_seconds,
-                        )
-                        self.log(
-                            "So moc boundary sau khi tao left/right: "
-                            f"{len(boundary_times)}"
-                        )
+                    boundary_times, boundary_examples = build_smooth_boundary_times(
+                        split_times,
+                        duration,
+                        smooth_seconds,
+                        smooth_mode,
+                    )
+                    self.log(f"Số boundary_times: {len(boundary_times)}")
 
+                    if boundary_examples:
                         for split_time, left, right in boundary_examples[:5]:
                             self.log(
-                                "Scene boundary "
-                                f"{split_time:.3f}s -> cut points "
-                                f"{left:.3f}s and {right:.3f}s"
+                                f"Mốc {split_time:.3f}s -> "
+                                f"{left:.3f}s, {right:.3f}s"
                             )
 
-                        if boundary_times:
-                            segment_times = boundary_times
-                            discard_smooth_segments = True
-                        else:
-                            self.log(
-                                "Khong tao duoc boundary hop le, "
-                                "xu ly nhu khong lam muot."
-                            )
+                    if boundary_times:
+                        segment_times = boundary_times
+                        discard_smooth_segments = True
+                    else:
+                        self.log(
+                            "Không có boundary_times hợp lệ, xử lý như không làm mượt."
+                        )
 
-                segment_times_text = format_split_times(segment_times)
                 expected_temp_segments = len(segment_times) + 1
                 total_scenes = (
                     sum(1 for index in range(expected_temp_segments) if index % 2 == 0)
@@ -945,140 +1435,66 @@ class VideoCutterApp(ctk.CTk):
                 )
                 segment_progress_start = 0.12
 
-                segment_time_args = (
-                    [
-                        "-segment_times",
-                        segment_times_text,
-                    ]
-                    if segment_times
-                    else [
-                        "-segment_time",
-                        str(max_seconds),
-                    ]
+                segment_command = self.build_scene_segment_command(
+                    ffmpeg_path,
+                    video_path,
+                    temp_pattern,
+                    segment_times,
+                    max_seconds,
+                    duration,
+                    remove_audio,
                 )
 
-                if cut_type == CUT_BY_SCENE_FAST:
-                    segment_command = (
-                        base_command
-                        + [
-                            "-c",
-                            "copy",
-                            "-f",
-                            "segment",
-                        ]
-                        + segment_time_args
-                        + [
-                            "-reset_timestamps",
-                            "1",
-                            "-segment_start_number",
-                            "1",
-                            "-segment_format",
-                            "mp4",
-                            str(temp_pattern),
-                        ]
-                    )
-                else:
-                    scene_encode_args = [
-                        "-c:v",
-                        "libx264",
-                        "-preset",
-                        "ultrafast",
-                        "-crf",
-                        "23",
-                    ]
-                    force_keyframe_args = (
-                        [
-                            "-force_key_frames",
-                            segment_times_text,
-                        ]
-                        if segment_times
-                        else []
-                    )
-                    audio_encode_args = [
-                        "-c:a",
-                        "aac",
-                        "-b:a",
-                        "128k",
-                    ]
-                    accurate_segment_time_args = (
-                        [
-                            "-segment_times",
-                            segment_times_text,
-                            "-segment_time_delta",
-                            "0.05",
-                        ]
-                        if segment_times
-                        else [
-                            "-segment_time",
-                            str(max_seconds),
-                        ]
-                    )
-                    segment_command = (
-                        base_command
-                        + scene_encode_args
-                        + force_keyframe_args
-                        + audio_encode_args
-                        + [
-                            "-f",
-                            "segment",
-                        ]
-                        + accurate_segment_time_args
-                        + [
-                            "-reset_timestamps",
-                            "1",
-                            "-segment_start_number",
-                            "1",
-                            "-segment_format",
-                            "mp4",
-                            "-segment_format_options",
-                            "movflags=+faststart",
-                            str(temp_pattern),
-                        ]
-                    )
+            else:
+                raise RuntimeError("Kiểu cắt không hợp lệ.")
 
             if total_scenes <= 0:
-                raise RuntimeError("Video khong co thoi luong hop le.")
+                raise RuntimeError("Video không có segment hợp lệ.")
 
-            self.log(f"Tong so canh du kien: {total_scenes}")
-            self.log(f"Tong so segment tam du kien: {expected_temp_segments}")
-
-            self.log("Dang cat video bang mot lenh FFmpeg segment...")
+            self.log(f"Tổng số segment tạm dự kiến: {expected_temp_segments}")
+            self.log(f"Tổng số segment giữ dự kiến: {total_scenes}")
+            self.log("Đang cắt video bằng một lệnh FFmpeg segment...")
             self.set_progress(segment_progress_start)
+            self.check_cancelled()
 
             def update_segment_progress(value: float):
                 self.set_progress(
                     segment_progress_start + value * (0.75 - segment_progress_start)
                 )
 
-            run_ffmpeg_segment(segment_command, duration, update_segment_progress)
+            run_ffmpeg_segment(
+                segment_command,
+                duration,
+                update_segment_progress,
+                self.cancel_event,
+                self.set_current_process,
+            )
+            self.check_cancelled()
             self.set_progress(0.75)
-            self.log("FFmpeg da tao xong cac canh tam.")
+            self.log("FFmpeg đã tạo xong các segment tạm.")
 
             temp_files = sorted(temp_dir.glob("scene_*.mp4"))
 
             if not temp_files:
-                raise RuntimeError("FFmpeg da chay xong nhung khong tao file canh nao.")
+                raise RuntimeError("FFmpeg đã chạy xong nhưng không tạo file cảnh nào.")
 
-            self.log(f"So canh tam thuc te: {len(temp_files)}")
+            self.log(f"Số segment tạm thực tế: {len(temp_files)}")
 
             if len(temp_files) != expected_temp_segments:
                 self.log(
-                    "Luu y: so segment tam "
-                    f"({len(temp_files)}) khac du kien ({expected_temp_segments})."
+                    "Lưu ý: số segment tạm "
+                    f"({len(temp_files)}) khác dự kiến ({expected_temp_segments})."
                 )
 
             exported_count = 0
-            skipped_count = 0
             kept_segment_count = 0
-            dropped_smooth_segment_count = 0
 
             for temp_index, temp_file in enumerate(temp_files):
+                self.check_cancelled()
+
                 if discard_smooth_segments and temp_index % 2 == 1:
                     dropped_smooth_segment_count += 1
-                    self.log(
-                        "Bo segment lam muot tam "
-                        f"{temp_index + 1:03d}: {temp_file.name}"
-                    )
+                    self.log(f"Bỏ segment làm mượt tạm {temp_index}: {temp_file.name}")
                     self.set_progress(
                         0.75 + ((temp_index + 1) / len(temp_files)) * 0.25
                     )
@@ -1086,35 +1502,12 @@ class VideoCutterApp(ctk.CTk):
 
                 kept_segment_count += 1
                 scene_number = kept_segment_count
-                is_odd = scene_number % 2 == 1
-                is_even = scene_number % 2 == 0
-
-                should_export = False
-
-                if mode == "Tách cả cảnh lẻ và cảnh chẵn":
-                    should_export = True
-                elif mode == "Chỉ lấy cảnh lẻ" and is_odd:
-                    should_export = True
-                elif mode == "Chỉ lấy cảnh chẵn" and is_even:
-                    should_export = True
-
-                if not should_export:
-                    skipped_count += 1
-                    self.log(f"Bo qua canh {scene_number:03d}")
-                    self.set_progress(
-                        0.75 + ((temp_index + 1) / len(temp_files)) * 0.25
-                    )
-                    continue
-
-                if is_odd:
-                    target_dir = odd_dir
-                else:
-                    target_dir = even_dir
-
+                folder_index = ((scene_number - 1) % output_folder_count) + 1
+                target_dir = output_folders[folder_index - 1]
                 output_file = target_dir / f"{scene_number:03d}_{video_name}.mp4"
 
                 self.log(
-                    f"Chuyen canh {scene_number:03d} -> "
+                    f"Xuất cảnh {scene_number:03d} -> "
                     f"{target_dir.name}/{output_file.name}"
                 )
                 shutil.move(str(temp_file), str(output_file))
@@ -1127,12 +1520,13 @@ class VideoCutterApp(ctk.CTk):
             self.set_progress(1)
 
             self.log("")
-            self.log("HOAN THANH.")
-            self.log(f"So segment giu: {kept_segment_count}")
-            self.log(f"So segment bo: {dropped_smooth_segment_count}")
-            self.log(f"So canh da xuat: {exported_count}")
-            self.log(f"So canh bo qua: {skipped_count}")
-            self.log(f"Ket qua nam tai: {project_output_dir}")
+            self.log("HOÀN THÀNH.")
+            self.log(f"Số segment giữ: {kept_segment_count}")
+            if smooth_enabled:
+                self.log(f"Số segment bỏ do làm mượt: {dropped_smooth_segment_count}")
+            self.log(f"Số file đã xuất: {exported_count}")
+            self.log(f"Folder kết quả: {project_output_dir}")
+            self.last_output_dir = project_output_dir
 
             self.log_queue.put(
                 (
@@ -1141,14 +1535,33 @@ class VideoCutterApp(ctk.CTk):
                 )
             )
 
+        except ProcessingCancelled:
+            self.log("Đã hủy xử lý.")
+            self.cleanup_cancelled_output_dir()
+            self.log_queue.put(("cancelled", "Đã hủy xử lý."))
+
         except subprocess.CalledProcessError as error:
+            if self.cancel_event.is_set():
+                self.log("Đã hủy xử lý.")
+                self.cleanup_cancelled_output_dir()
+                self.log_queue.put(("cancelled", "Đã hủy xử lý."))
+                return
+
             error_text = error.stderr if error.stderr else str(error)
             self.log_queue.put(("error", f"FFmpeg bị lỗi:\n{error_text}"))
 
         except Exception as error:
+            if self.cancel_event.is_set():
+                self.log("Đã hủy xử lý.")
+                self.cleanup_cancelled_output_dir()
+                self.log_queue.put(("cancelled", "Đã hủy xử lý."))
+                return
+
             self.log_queue.put(("error", str(error)))
 
         finally:
+            self.set_current_process(None)
+
             if temp_dir is not None and temp_dir.exists():
                 shutil.rmtree(temp_dir, ignore_errors=True)
 
