@@ -12,6 +12,8 @@ import customtkinter as ctk
 
 
 APP_TITLE = "Video Scene Cutter"
+SPEED_FAST = "Nhanh - không encode lại"
+SPEED_STANDARD = "Chuẩn - encode lại"
 
 
 def safe_filename(name: str) -> str:
@@ -44,16 +46,72 @@ def find_ffmpeg_tools():
     return ffmpeg_path, ffprobe_path
 
 
-def run_command(command: list[str]):
-    subprocess.run(
+def parse_ffmpeg_time(value: str) -> float | None:
+    try:
+        hours, minutes, seconds = value.split(":")
+        return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+    except ValueError:
+        return None
+
+
+def run_ffmpeg_segment(
+    command: list[str],
+    duration: float,
+    progress_callback,
+):
+    process = subprocess.Popen(
         command,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
-        check=True,
         encoding="utf-8",
         errors="replace",
     )
+
+    stderr_lines = []
+
+    def collect_stderr():
+        if process.stderr is None:
+            return
+
+        for line in process.stderr:
+            stderr_lines.append(line)
+
+    stderr_thread = threading.Thread(target=collect_stderr, daemon=True)
+    stderr_thread.start()
+
+    try:
+        if process.stdout is not None:
+            for raw_line in process.stdout:
+                line = raw_line.strip()
+                elapsed = None
+
+                if line.startswith("out_time_ms="):
+                    try:
+                        elapsed = int(line.partition("=")[2]) / 1_000_000
+                    except ValueError:
+                        elapsed = None
+
+                elif line.startswith("out_time="):
+                    elapsed = parse_ffmpeg_time(line.partition("=")[2])
+
+                if elapsed is not None and duration > 0:
+                    progress_callback(max(0, min(elapsed / duration, 1)))
+
+        return_code = process.wait()
+        stderr_thread.join(timeout=2)
+
+    except Exception:
+        process.kill()
+        stderr_thread.join(timeout=2)
+        raise
+
+    if return_code != 0:
+        raise subprocess.CalledProcessError(
+            return_code,
+            command,
+            stderr="".join(stderr_lines),
+        )
 
 
 def get_video_duration(video_path: Path, ffprobe_path: str) -> float:
@@ -95,6 +153,7 @@ class VideoCutterApp(ctk.CTk):
         self.output_dir_var = ctk.StringVar()
         self.seconds_var = ctk.StringVar(value="3")
         self.mode_var = ctk.StringVar(value="Tách cả cảnh lẻ và cảnh chẵn")
+        self.speed_var = ctk.StringVar(value=SPEED_FAST)
 
         self.log_queue = queue.Queue()
         self.worker_thread = None
@@ -186,6 +245,24 @@ class VideoCutterApp(ctk.CTk):
             width=240,
         )
         mode_menu.pack(side="left", padx=6)
+
+        speed_row = ctk.CTkFrame(main_frame)
+        speed_row.pack(fill="x", padx=16, pady=8)
+
+        ctk.CTkLabel(speed_row, text="Tốc độ xử lý:", width=140).pack(
+            side="left", padx=(8, 6)
+        )
+
+        speed_menu = ctk.CTkOptionMenu(
+            speed_row,
+            variable=self.speed_var,
+            values=[
+                SPEED_FAST,
+                SPEED_STANDARD,
+            ],
+            width=240,
+        )
+        speed_menu.pack(side="left", padx=6)
 
         # Buttons
         button_row = ctk.CTkFrame(main_frame)
@@ -313,10 +390,11 @@ class VideoCutterApp(ctk.CTk):
         self.log_box.configure(state="disabled")
 
         mode = self.mode_var.get()
+        speed_mode = self.speed_var.get()
 
         self.worker_thread = threading.Thread(
             target=self.process_video,
-            args=(video_path, output_dir, seconds, mode),
+            args=(video_path, output_dir, seconds, mode, speed_mode),
             daemon=True,
         )
         self.worker_thread.start()
@@ -327,7 +405,10 @@ class VideoCutterApp(ctk.CTk):
         output_dir: Path,
         segment_seconds: float,
         mode: str,
+        speed_mode: str,
     ):
+        temp_dir = None
+
         try:
             ffmpeg_path, ffprobe_path = find_ffmpeg_tools()
 
@@ -339,6 +420,8 @@ class VideoCutterApp(ctk.CTk):
 
             odd_dir = project_output_dir / "odd_scenes"
             even_dir = project_output_dir / "even_scenes"
+            temp_dir = project_output_dir / "temp_scenes"
+            temp_dir.mkdir(parents=True, exist_ok=True)
 
             if mode in ["Tách cả cảnh lẻ và cảnh chẵn", "Chỉ lấy cảnh lẻ"]:
                 odd_dir.mkdir(parents=True, exist_ok=True)
@@ -351,6 +434,7 @@ class VideoCutterApp(ctk.CTk):
             self.log(f"Thu muc xuat: {project_output_dir}")
             self.log(f"So giay moi canh: {segment_seconds}")
             self.log(f"Che do: {mode}")
+            self.log(f"Toc do xu ly: {speed_mode}")
 
             duration = get_video_duration(video_path, ffprobe_path)
             total_scenes = math.ceil(duration / segment_seconds)
@@ -361,13 +445,95 @@ class VideoCutterApp(ctk.CTk):
             if total_scenes <= 0:
                 raise RuntimeError("Video khong co thoi luong hop le.")
 
+            temp_pattern = temp_dir / "scene_%03d.mp4"
+            base_command = [
+                ffmpeg_path,
+                "-y",
+                "-progress",
+                "pipe:1",
+                "-nostats",
+                "-i",
+                str(video_path),
+
+                "-map",
+                "0:v:0",
+                "-map",
+                "0:a?",
+            ]
+
+            if speed_mode == SPEED_FAST:
+                codec_options = [
+                    "-c",
+                    "copy",
+                ]
+            else:
+                codec_options = [
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "ultrafast",
+                    "-crf",
+                    "23",
+                    "-force_key_frames",
+                    f"expr:gte(t,n_forced*{segment_seconds})",
+                    "-c:a",
+                    "aac",
+                    "-b:a",
+                    "128k",
+                ]
+
+            segment_options = [
+                "-f",
+                "segment",
+                "-segment_time",
+                str(segment_seconds),
+                "-reset_timestamps",
+                "1",
+                "-segment_start_number",
+                "1",
+                "-segment_format",
+                "mp4",
+            ]
+
+            if speed_mode == SPEED_STANDARD:
+                segment_options.extend(
+                    [
+                        "-segment_format_options",
+                        "movflags=+faststart",
+                    ]
+                )
+
+            segment_command = base_command + codec_options + segment_options + [
+                str(temp_pattern)
+            ]
+
+            self.log("Dang cat video bang mot lenh FFmpeg segment...")
+            self.set_progress(0.03)
+
+            def update_segment_progress(value: float):
+                self.set_progress(0.05 + value * 0.70)
+
+            run_ffmpeg_segment(segment_command, duration, update_segment_progress)
+            self.set_progress(0.75)
+            self.log("FFmpeg da tao xong cac canh tam.")
+
+            temp_files = sorted(temp_dir.glob("scene_*.mp4"))
+
+            if not temp_files:
+                raise RuntimeError("FFmpeg da chay xong nhung khong tao file canh nao.")
+
+            self.log(f"So canh tam thuc te: {len(temp_files)}")
+
+            if len(temp_files) != total_scenes:
+                self.log(
+                    f"Luu y: so canh tam ({len(temp_files)}) khac du kien ({total_scenes})."
+                )
+
             exported_count = 0
             skipped_count = 0
 
-            for index in range(total_scenes):
-                scene_number = index + 1
-                start_time = index * segment_seconds
-
+            for index, temp_file in enumerate(temp_files, start=1):
+                scene_number = index
                 is_odd = scene_number % 2 == 1
                 is_even = scene_number % 2 == 0
 
@@ -383,7 +549,7 @@ class VideoCutterApp(ctk.CTk):
                 if not should_export:
                     skipped_count += 1
                     self.log(f"Bo qua canh {scene_number:03d}")
-                    self.set_progress(scene_number / total_scenes)
+                    self.set_progress(0.75 + (index / len(temp_files)) * 0.25)
                     continue
 
                 if is_odd:
@@ -393,47 +559,14 @@ class VideoCutterApp(ctk.CTk):
 
                 output_file = target_dir / f"{scene_number:03d}_{video_name}.mp4"
 
-                self.log(f"Dang cat canh {scene_number:03d} -> {output_file.name}")
-
-                command = [
-                    ffmpeg_path,
-                    "-y",
-                    "-ss",
-                    str(start_time),
-                    "-i",
-                    str(video_path),
-                    "-t",
-                    str(segment_seconds),
-
-                    "-map",
-                    "0:v:0",
-                    "-map",
-                    "0:a?",
-
-                    "-c:v",
-                    "libx264",
-                    "-preset",
-                    "veryfast",
-                    "-crf",
-                    "18",
-
-                    "-c:a",
-                    "aac",
-                    "-b:a",
-                    "128k",
-
-                    "-movflags",
-                    "+faststart",
-                    "-avoid_negative_ts",
-                    "make_zero",
-
-                    str(output_file),
-                ]
-
-                run_command(command)
+                self.log(
+                    f"Chuyen canh {scene_number:03d} -> "
+                    f"{target_dir.name}/{output_file.name}"
+                )
+                shutil.move(str(temp_file), str(output_file))
 
                 exported_count += 1
-                self.set_progress(scene_number / total_scenes)
+                self.set_progress(0.75 + (index / len(temp_files)) * 0.25)
 
             self.set_progress(1)
 
@@ -456,6 +589,10 @@ class VideoCutterApp(ctk.CTk):
 
         except Exception as error:
             self.log_queue.put(("error", str(error)))
+
+        finally:
+            if temp_dir is not None and temp_dir.exists():
+                shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":
