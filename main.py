@@ -68,6 +68,13 @@ def find_ffmpeg_tools():
     return ffmpeg_path, ffprobe_path
 
 
+def get_subprocess_creationflags():
+    if os.name == "nt":
+        return subprocess.CREATE_NO_WINDOW
+
+    return 0
+
+
 def parse_ffmpeg_time(value: str) -> float | None:
     try:
         hours, minutes, seconds = value.split(":")
@@ -93,6 +100,7 @@ def run_ffmpeg_segment(
         text=True,
         encoding="utf-8",
         errors="replace",
+        creationflags=get_subprocess_creationflags(),
     )
 
     if process_callback is not None:
@@ -190,6 +198,7 @@ def get_video_duration(video_path: Path, ffprobe_path: str) -> float:
         check=True,
         encoding="utf-8",
         errors="replace",
+        creationflags=get_subprocess_creationflags(),
     )
 
     return float(result.stdout.strip())
@@ -235,6 +244,7 @@ def detect_scene_changes(
         text=True,
         encoding="utf-8",
         errors="replace",
+        creationflags=get_subprocess_creationflags(),
     )
 
     if process_callback is not None:
