@@ -19,3 +19,9 @@ Tool cắt video tự động theo thời lượng hoặc chuyển cảnh.
 ```cmd
 .venv\Scripts\activate.bat
 python main.py
+
+Sau đó:
+
+```cmd
+git add README.md
+git commit -m "Add readme"

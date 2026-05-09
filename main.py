@@ -4,6 +4,7 @@ import queue
 import re
 import shutil
 import subprocess
+import sys
 import threading
 from datetime import datetime
 from pathlib import Path
@@ -32,6 +33,9 @@ CANCEL_COLOR = "#6b7280"
 CANCEL_HOVER_COLOR = "#b94a48"
 LOG_BG_COLOR = "#111827"
 LOG_TEXT_COLOR = "#e5e7eb"
+FONT_SIZE = 14
+TITLE_FONT_SIZE = 23
+LOG_FONT_SIZE = 13
 
 
 class ProcessingCancelled(Exception):
@@ -53,6 +57,16 @@ def safe_filename(name: str) -> str:
         name = "video"
 
     return name
+
+
+def resource_path(relative_path: str) -> Path:
+    """Resolve a resource path for Python and PyInstaller onefile builds."""
+    if getattr(sys, "_MEIPASS", None):
+        base_path = Path(sys._MEIPASS)
+    else:
+        base_path = Path(__file__).resolve().parent
+
+    return base_path / relative_path
 
 
 def find_ffmpeg_tools():
@@ -416,8 +430,7 @@ class VideoCutterApp(ctk.CTk):
         self.after(100, self.process_log_queue)
 
     def load_window_icon(self):
-        app_dir = Path(__file__).resolve().parent
-        icon_path = app_dir / "icon_scissors.ico"
+        icon_path = resource_path("icon_scissors.ico")
 
         if not icon_path.exists():
             return
@@ -448,7 +461,7 @@ class VideoCutterApp(ctk.CTk):
             width=label_width,
             anchor="w",
             text_color=MUTED_TEXT_COLOR,
-            font=ctk.CTkFont(size=13),
+            font=ctk.CTkFont(size=FONT_SIZE),
         ).pack(side="left", padx=(0, 10))
 
         return row
@@ -460,7 +473,7 @@ class VideoCutterApp(ctk.CTk):
             border_color="#d1d5db",
             text_color=TEXT_COLOR,
             placeholder_text_color="#94a3b8",
-            font=ctk.CTkFont(size=13),
+            font=ctk.CTkFont(size=FONT_SIZE),
             corner_radius=7,
         )
 
@@ -471,8 +484,8 @@ class VideoCutterApp(ctk.CTk):
             button_color="#e5e7eb",
             button_hover_color="#d1d5db",
             text_color=TEXT_COLOR,
-            font=ctk.CTkFont(size=13),
-            dropdown_font=ctk.CTkFont(size=13),
+            font=ctk.CTkFont(size=FONT_SIZE),
+            dropdown_font=ctk.CTkFont(size=FONT_SIZE),
             dropdown_fg_color="#ffffff",
             dropdown_hover_color="#eef2ff",
             dropdown_text_color=TEXT_COLOR,
@@ -483,17 +496,45 @@ class VideoCutterApp(ctk.CTk):
     def style_primary_option_menu(self, menu):
         menu.configure(
             height=34,
-            fg_color=PRIMARY_COLOR,
-            button_color=PRIMARY_COLOR,
-            button_hover_color=PRIMARY_HOVER_COLOR,
-            text_color="#ffffff",
-            font=ctk.CTkFont(size=13, weight="bold"),
-            dropdown_font=ctk.CTkFont(size=13),
-            dropdown_fg_color="#ffffff",
-            dropdown_hover_color="#dbeafe",
-            dropdown_text_color=TEXT_COLOR,
+            fg_color="#3498DB",
+            button_color="#3498DB",
+            button_hover_color="#3498DB",
+            text_color="white",
+            font=ctk.CTkFont(size=FONT_SIZE, weight="bold"),
+            dropdown_font=ctk.CTkFont(size=FONT_SIZE),
+            dropdown_fg_color="white",
+            dropdown_hover_color="#EAF3FF",
+            dropdown_text_color="#111827",
             corner_radius=8,
             dynamic_resizing=False,
+        )
+
+    def add_cut_type_dropdown_arrow(self):
+        def hide_default_arrow():
+            try:
+                self.cut_type_menu._canvas.itemconfigure(
+                    "dropdown_arrow",
+                    state="hidden",
+                )
+            except Exception:
+                return
+
+        hide_default_arrow()
+        self.after_idle(hide_default_arrow)
+
+        self.cut_type_arrow_label = ctk.CTkLabel(
+            self.cut_type_menu,
+            text="▼",
+            width=28,
+            height=24,
+            fg_color="#3498DB",
+            text_color="white",
+            font=ctk.CTkFont(size=12, weight="bold"),
+        )
+        self.cut_type_arrow_label.place(relx=1.0, rely=0.5, x=-17, y=0, anchor="center")
+        self.cut_type_arrow_label.bind(
+            "<Button-1>",
+            lambda event: self.cut_type_menu._clicked(event),
         )
 
     def create_path_section(
@@ -518,7 +559,7 @@ class VideoCutterApp(ctk.CTk):
             width=130,
             anchor="w",
             text_color=MUTED_TEXT_COLOR,
-            font=ctk.CTkFont(size=13),
+            font=ctk.CTkFont(size=FONT_SIZE),
         ).pack(side="left", padx=(0, 10))
 
         entry = ctk.CTkEntry(
@@ -536,7 +577,7 @@ class VideoCutterApp(ctk.CTk):
             height=32,
             fg_color=button_color,
             hover_color=button_hover_color,
-            font=ctk.CTkFont(size=13),
+            font=ctk.CTkFont(size=FONT_SIZE),
             corner_radius=7,
             command=command,
         ).pack(side="left")
@@ -556,7 +597,7 @@ class VideoCutterApp(ctk.CTk):
             anchor="center",
             justify="center",
             text_color=TEXT_COLOR,
-            font=ctk.CTkFont(size=22, weight="bold"),
+            font=ctk.CTkFont(size=TITLE_FONT_SIZE, weight="bold"),
         ).pack(fill="x")
 
         self.create_path_section(
@@ -593,6 +634,7 @@ class VideoCutterApp(ctk.CTk):
         )
         self.style_primary_option_menu(self.cut_type_menu)
         self.cut_type_menu.pack(side="left")
+        self.add_cut_type_dropdown_arrow()
 
         self.duration_settings_row = self.create_field_row(
             settings_section,
@@ -620,6 +662,7 @@ class VideoCutterApp(ctk.CTk):
             self.scene_settings_row,
             text="Max (s):",
             text_color=MUTED_TEXT_COLOR,
+            font=ctk.CTkFont(size=FONT_SIZE),
         ).pack(side="left", padx=(0, 8))
         self.max_seconds_entry = ctk.CTkEntry(
             self.scene_settings_row,
@@ -633,6 +676,7 @@ class VideoCutterApp(ctk.CTk):
             self.scene_settings_row,
             text="Scene threshold:",
             text_color=MUTED_TEXT_COLOR,
+            font=ctk.CTkFont(size=FONT_SIZE),
         ).pack(side="left", padx=(0, 8))
         self.scene_threshold_entry = ctk.CTkEntry(
             self.scene_settings_row,
@@ -671,6 +715,7 @@ class VideoCutterApp(ctk.CTk):
             self.smooth_settings_frame,
             text="giây",
             text_color=MUTED_TEXT_COLOR,
+            font=ctk.CTkFont(size=FONT_SIZE),
         ).pack(side="left", padx=(0, 12))
 
         self.smooth_mode_menu = ctk.CTkOptionMenu(
@@ -697,13 +742,14 @@ class VideoCutterApp(ctk.CTk):
             self.output_options_row,
             text="folder",
             text_color=MUTED_TEXT_COLOR,
+            font=ctk.CTkFont(size=FONT_SIZE),
         ).pack(side="left", padx=(0, 50))
 
         ctk.CTkLabel(
             self.output_options_row,
             text="Xóa audio:",
             text_color=MUTED_TEXT_COLOR,
-            font=ctk.CTkFont(size=13),
+            font=ctk.CTkFont(size=FONT_SIZE),
         ).pack(side="left", padx=(0, 10))
 
         self.remove_audio_switch = ctk.CTkSwitch(
@@ -732,7 +778,7 @@ class VideoCutterApp(ctk.CTk):
             height=34,
             fg_color=PRIMARY_COLOR,
             hover_color=PRIMARY_HOVER_COLOR,
-            font=ctk.CTkFont(size=13, weight="bold"),
+            font=ctk.CTkFont(size=FONT_SIZE, weight="bold"),
             corner_radius=7,
             command=self.start_processing,
         )
@@ -745,7 +791,7 @@ class VideoCutterApp(ctk.CTk):
             height=34,
             fg_color=CANCEL_COLOR,
             hover_color=CANCEL_HOVER_COLOR,
-            font=ctk.CTkFont(size=13),
+            font=ctk.CTkFont(size=FONT_SIZE),
             corner_radius=7,
             state="disabled",
             command=self.cancel_processing,
@@ -759,7 +805,7 @@ class VideoCutterApp(ctk.CTk):
             height=34,
             fg_color="#4b5563",
             hover_color="#374151",
-            font=ctk.CTkFont(size=13),
+            font=ctk.CTkFont(size=FONT_SIZE),
             corner_radius=7,
             state="disabled",
             command=self.open_last_output_dir,
@@ -775,7 +821,7 @@ class VideoCutterApp(ctk.CTk):
             width=130,
             anchor="w",
             text_color=MUTED_TEXT_COLOR,
-            font=ctk.CTkFont(size=13),
+            font=ctk.CTkFont(size=FONT_SIZE),
         ).pack(side="left", padx=(0, 12))
 
         self.progress_bar = ctk.CTkProgressBar(
@@ -793,7 +839,7 @@ class VideoCutterApp(ctk.CTk):
             width=54,
             anchor="e",
             text_color=TEXT_COLOR,
-            font=ctk.CTkFont(size=13, weight="normal"),
+            font=ctk.CTkFont(size=FONT_SIZE, weight="normal"),
         )
         self.progress_label.pack(side="left")
 
@@ -811,7 +857,7 @@ class VideoCutterApp(ctk.CTk):
             text="Nhật ký xử lý:",
             anchor="w",
             text_color=MUTED_TEXT_COLOR,
-            font=ctk.CTkFont(size=13),
+            font=ctk.CTkFont(size=FONT_SIZE),
         ).pack(fill="x", padx=14, pady=(10, 4))
 
         self.log_box = ctk.CTkTextbox(
@@ -822,7 +868,7 @@ class VideoCutterApp(ctk.CTk):
             border_width=1,
             border_color="#1f2937",
             corner_radius=8,
-            font=ctk.CTkFont(family="Consolas", size=12),
+            font=ctk.CTkFont(family="Consolas", size=LOG_FONT_SIZE),
         )
         self.log_box.pack(fill="both", expand=True, padx=14, pady=(4, 14))
         self.log_box.configure(state="disabled")
