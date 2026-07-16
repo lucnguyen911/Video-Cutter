@@ -1,0 +1,550 @@
+==================================================
+SCENE MODE CURRENT CODE AUDIT
+==================================================
+
+--- Constants (Lines 31-41) ---
+31: CUT_FIXED = "fixed"
+32: CUT_BY_SCENE = "scene"
+33: SMOOTH_TRIM_TAIL = "trim_tail"
+34: SMOOTH_TRIM_HEAD = "trim_head"
+35: OUTPUT_MODE_SPLIT_FOLDER  = 0
+36: OUTPUT_MODE_MERGE_DEFAULT = 1
+37: OUTPUT_MODE_MERGE_RENAME  = 2
+38: MIN_BOUNDARY_GAP = 0.05
+39: SHORT_FRAGMENT_THRESHOLD = 1.0
+40: MAX_SHORT_FRAGMENT_EXTENSION = 2.0
+41: VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".flv", ".wmv", ".m4v"}
+
+
+--- get_video_duration (Lines 524-546) ---
+524: def get_video_duration(video_path: Path, ffprobe_path: str) -> float:
+525:     command = [
+526:         ffprobe_path,
+527:         "-v",
+528:         "error",
+529:         "-show_entries",
+530:         "format=duration",
+531:         "-of",
+532:         "default=noprint_wrappers=1:nokey=1",
+533:         str(video_path),
+534:     ]
+535: 
+536:     result = subprocess.run(
+537:         command,
+538:         capture_output=True,
+539:         text=True,
+540:         check=True,
+541:         encoding="utf-8",
+542:         errors="replace",
+543:         creationflags=get_subprocess_creationflags(),
+544:     )
+545: 
+546:     return float(result.stdout.strip())
+
+
+--- normalize_split_times (Lines 549-556) ---
+549: def normalize_split_times(split_times: list[float], duration: float) -> list[float]:
+550:     normalized = {
+551:         round(split_time, 3)
+552:         for split_time in split_times
+553:         if 0 < split_time < duration
+554:     }
+555: 
+556:     return sorted(normalized)
+
+
+--- detect_scene_changes (Lines 559-625) ---
+559: def detect_scene_changes(
+560:     video_path: Path,
+561:     ffmpeg_path: str,
+562:     threshold: float,
+563:     cancel_event: threading.Event | None = None,
+564:     process_callback=None,
+565:     hardware_type: str = "cpu"
+566: ) -> list[float]:
+567:     if cancel_event is not None and cancel_event.is_set():
+568:         raise ProcessingCancelled("Processing cancelled.")
+569: 
+570:     command = [ffmpeg_path]
+571:     
+572:     # Rẽ nhánh tăng tốc phần cứng khi giải mã quét khung hình
+573:     if hardware_type == "nvidia":
+574:         command += ["-hwaccel", "cuda"]
+575:     elif hardware_type == "amd":
+576:         command += ["-hwaccel", "d3d11va"]
+577: 
+578:     command += [
+579:         "-hide_banner",
+580:         "-i",
+581:         str(video_path),
+582:         "-filter:v",
+583:         f"fps=10,scale=256:-1,select='gt(scene,{threshold})',showinfo",
+584:         "-an",
+585:         "-f",
+586:         "null",
+587:         "-",
+588:     ]
+589: 
+590:     process = subprocess.Popen(
+591:         command,
+592:         stdout=subprocess.PIPE,
+593:         stderr=subprocess.PIPE,
+594:         text=True,
+595:         encoding="utf-8",
+596:         errors="replace",
+597:         creationflags=get_subprocess_creationflags(),
+598:     )
+599: 
+600:     if process_callback is not None:
+601:         process_callback(process)
+602: 
+603:     try:
+604:         _, stderr = process.communicate()
+605:     finally:
+606:         if process_callback is not None:
+607:             process_callback(None)
+608: 
+609:     if cancel_event is not None and cancel_event.is_set():
+610:         if process.poll() is None:
+611:             process.terminate()
+612:         raise ProcessingCancelled("Processing cancelled.")
+613: 
+614:     if process.returncode != 0:
+615:         raise subprocess.CalledProcessError(
+616:             process.returncode,
+617:             command,
+618:             stderr=stderr,
+619:         )
+620: 
+621:     scene_times = []
+622:     for match in re.finditer(r"pts_time:([0-9]+(?:\.[0-9]+)?)", stderr):
+623:         scene_times.append(float(match.group(1)))
+624: 
+625:     return sorted(set(scene_times))
+
+
+--- build_scene_split_times (Lines 644-677) ---
+644: def build_scene_split_times(
+645:     scene_times: list[float],
+646:     duration: float,
+647:     min_seconds: float,
+648:     max_seconds: float,
+649: ) -> list[float]:
+650:     scene_times = normalize_split_times(scene_times, duration)
+651:     split_times = []
+652:     start_time = 0.0
+653: 
+654:     while duration - start_time > max_seconds:
+655:         min_cut_time = start_time + min_seconds
+656:         max_cut_time = start_time + max_seconds
+657:         candidates = [
+658:             scene_time
+659:             for scene_time in scene_times
+660:             if min_cut_time <= scene_time <= max_cut_time
+661:         ]
+662: 
+663:         if candidates:
+664:             split_time = candidates[-1]
+665:         else:
+666:             split_time = max_cut_time
+667: 
+668:         if split_time <= start_time:
+669:             break
+670: 
+671:         split_times.append(split_time)
+672:         start_time = split_time
+673: 
+674:     if 0 < duration - start_time < min_seconds and split_times:
+675:         split_times.pop()
+676: 
+677:     return normalize_split_times(split_times, duration)
+
+
+--- build_smooth_boundary_times (Lines 680-780) ---
+680: def build_smooth_boundary_times(
+681:     split_times: list[float],
+682:     scene_times: list[float],
+683:     duration: float,
+684:     smooth_seconds: float,
+685:     short_fragment_threshold: float = SHORT_FRAGMENT_THRESHOLD,
+686:     max_fragment_extension: float = MAX_SHORT_FRAGMENT_EXTENSION,
+687: ) -> tuple[list[float], list[tuple[float, float, float]]]:
+688:     """
+689:     Symmetric smooth: cut t seconds from BOTH sides of each scene boundary.
+690:     The boundary left/right edges can be extended up to the nearest scene change
+691:     to eliminate extremely short visual fragments near the smooth boundary region.
+692:     This function does not modify split_times.
+693:     """
+694:     if smooth_seconds <= 0:
+695:         return [], []
+696: 
+697:     from bisect import bisect_left, bisect_right
+698: 
+699:     normalized_splits = normalize_split_times(split_times, duration)
+700:     normalized_scenes = normalize_split_times(scene_times, duration)
+701: 
+702:     boundary_times = []
+703:     examples = []
+704:     last_boundary_time = 0.0
+705: 
+706:     for split_time in normalized_splits:
+707:         nominal_left = round(split_time - smooth_seconds, 3)
+708:         nominal_right = round(split_time + smooth_seconds, 3)
+709: 
+710:         adjusted_left = nominal_left
+711:         adjusted_right = nominal_right
+712: 
+713:         # 4.1. Kiểm tra phía trái
+714:         while True:
+715:             idx = bisect_left(normalized_scenes, adjusted_left)
+716:             if idx > 0:
+717:                 prev_scene = normalized_scenes[idx - 1]
+718:                 dist = adjusted_left - prev_scene
+719:                 ext = nominal_left - prev_scene
+720:                 if dist <= short_fragment_threshold and ext <= max_fragment_extension:
+721:                     if prev_scene > 0:
+722:                         adjusted_left = prev_scene
+723:                     else:
+724:                         break
+725:                 else:
+726:                     break
+727:             else:
+728:                 break
+729: 
+730:         # 4.2. Kiểm tra phía phải
+731:         while True:
+732:             idx = bisect_right(normalized_scenes, adjusted_right)
+733:             if idx < len(normalized_scenes):
+734:                 next_scene = normalized_scenes[idx]
+735:                 dist = next_scene - adjusted_right
+736:                 ext = next_scene - nominal_right
+737:                 if dist <= short_fragment_threshold and ext <= max_fragment_extension:
+738:                     if next_scene < duration:
+739:                         adjusted_right = next_scene
+740:                     else:
+741:                         break
+742:                 else:
+743:                     break
+744:             else:
+745:                 break
+746: 
+747:         adjusted_left = round(adjusted_left, 3)
+748:         adjusted_right = round(adjusted_right, 3)
+749: 
+750:         adjusted_valid = (
+751:             adjusted_left > 0 and
+752:             adjusted_right < duration and
+753:             adjusted_right > adjusted_left and
+754:             round(adjusted_right - adjusted_left, 3) >= MIN_BOUNDARY_GAP and
+755:             round(adjusted_left - last_boundary_time, 3) >= MIN_BOUNDARY_GAP
+756:         )
+757: 
+758:         if adjusted_valid:
+759:             left = adjusted_left
+760:             right = adjusted_right
+761:         else:
+762:             # Fallback to nominal boundary
+763:             nominal_valid = (
+764:                 nominal_left > 0 and
+765:                 nominal_right < duration and
+766:                 nominal_right > nominal_left and
+767:                 round(nominal_right - nominal_left, 3) >= MIN_BOUNDARY_GAP and
+768:                 round(nominal_left - last_boundary_time, 3) >= MIN_BOUNDARY_GAP
+769:             )
+770:             if nominal_valid:
+771:                 left = nominal_left
+772:                 right = nominal_right
+773:             else:
+774:                 continue
+775: 
+776:         boundary_times.extend([left, right])
+777:         examples.append((split_time, left, right))
+778:         last_boundary_time = right
+779: 
+780:     return normalize_split_times(boundary_times, duration), examples
+
+
+--- format_split_times (Lines 783-790) ---
+783: def format_split_times(split_times: list[float]) -> str:
+784:     formatted_times = []
+785: 
+786:     for split_time in split_times:
+787:         formatted_time = f"{split_time:.3f}".rstrip("0").rstrip(".")
+788:         formatted_times.append(formatted_time)
+789: 
+790:     return ",".join(formatted_times)
+
+
+--- Validate UI (Lines 2033-2093) ---
+2033:         segment_seconds = None
+2034:         min_seconds = None
+2035:         max_seconds = None
+2036:         scene_threshold = None
+2037:         smooth_enabled = False
+2038:         smooth_seconds = 0.0
+2039: 
+2040:         if cut_type == CUT_FIXED:
+2041:             try:
+2042:                 segment_seconds = float(self.seconds_entry.text().strip())
+2043:             except ValueError:
+2044:                 raise ValueError(self.t("msg_duration_number"))
+2045: 
+2046:             if segment_seconds <= 0:
+2047:                 raise ValueError(self.t("msg_duration_positive"))
+2048: 
+2049:         elif cut_type == CUT_BY_SCENE:
+2050:             try:
+2051:                 min_seconds = float(self.min_seconds_entry.text().strip())
+2052:                 max_seconds = float(self.max_seconds_entry.text().strip())
+2053:                 scene_threshold = float(self.scene_threshold_entry.text().strip())
+2054:             except ValueError:
+2055:                 raise ValueError(self.t("msg_scene_params_number"))
+2056: 
+2057:             if min_seconds <= 0:
+2058:                 raise ValueError(self.t("msg_min_positive"))
+2059: 
+2060:             if max_seconds <= min_seconds:
+2061:                 raise ValueError(self.t("msg_max_gt_min"))
+2062: 
+2063:             if not 0 < scene_threshold < 1:
+2064:                 raise ValueError(self.t("msg_threshold_range"))
+2065: 
+2066:             smooth_enabled = self.smooth_switch.isChecked()
+2067: 
+2068:             if smooth_enabled:
+2069:                 try:
+2070:                     smooth_seconds = float(self.smooth_seconds_entry.text().strip())
+2071:                 except ValueError:
+2072:                     raise ValueError(self.t("msg_smooth_number"))
+2073: 
+2074:                 if smooth_seconds < 0:
+2075:                     raise ValueError(self.t("msg_smooth_positive"))
+2076: 
+2077:         else:
+2078:             raise ValueError(self.t("msg_cut_type_invalid"))
+2079: 
+2080:         return (
+2081:             output_dir,
+2082:             cut_type,
+2083:             segment_seconds,
+2084:             min_seconds,
+2085:             max_seconds,
+2086:             scene_threshold,
+2087:             output_folder_count,
+2088:             self.remove_audio,
+2089:             smooth_enabled,
+2090:             smooth_seconds,
+2091:             output_mode,
+2092:             project_name,
+2093:         )
+
+
+--- elif cut_type == CUT_BY_SCENE (Lines 2449-2547) ---
+2449:             elif cut_type == CUT_BY_SCENE:
+2450:                 if (
+2451:                     min_seconds is None
+2452:                     or max_seconds is None
+2453:                     or scene_threshold is None
+2454:                 ):
+2455:                     raise RuntimeError(self.t("log_missing_scene_params"))
+2456: 
+2457:                 self.log(self.t("log_scene_encode"))
+2458:                 self.log(self.t("log_min_seconds").format(val=min_seconds))
+2459:                 self.log(self.t("log_max_seconds").format(val=max_seconds))
+2460:                 self.log(self.t("log_threshold").format(val=scene_threshold))
+2461:                 self.log(self.t("log_smooth").format(status=on_off(smooth_enabled)))
+2462:                 self.log(self.t("log_scanning_scenes"))
+2463:                 progress_callback(0.02)
+2464: 
+2465:                 scene_times = detect_scene_changes(
+2466:                     video_path,
+2467:                     ffmpeg_path,
+2468:                     scene_threshold,
+2469:                     self.cancel_event,
+2470:                     self.set_current_process,
+2471:                     self.hardware_type,
+2472:                 )
+2473:                 self.check_cancelled()
+2474:                 progress_callback(0.10)
+2475:                 self.log(
+2476:                     self.t("log_scene_count").format(count=len(scene_times)),
+2477:                 )
+2478: 
+2479:                 split_times = build_scene_split_times(
+2480:                     scene_times,
+2481:                     duration,
+2482:                     min_seconds,
+2483:                     max_seconds,
+2484:                 )
+2485:                 split_times = normalize_split_times(split_times, duration)
+2486:                 self.log(
+2487:                     self.t("log_split_count").format(count=len(split_times)),
+2488:                 )
+2489: 
+2490:                 segment_times = split_times
+2491: 
+2492:                 if smooth_enabled:
+2493:                     self.log(
+2494:                         self.t("log_smooth_seconds").format(val=smooth_seconds),
+2495:                     )
+2496: 
+2497:                     boundary_times, boundary_examples = (
+2498:                         build_smooth_boundary_times(
+2499:                             split_times,
+2500:                             scene_times,
+2501:                             duration,
+2502:                             smooth_seconds,
+2503:                         )
+2504:                     )
+2505:                     self.log(
+2506:                         self.t("log_boundary_count").format(
+2507:                             count=len(boundary_times),
+2508:                         ),
+2509:                     )
+2510: 
+2511:                     if boundary_examples:
+2512:                         for split_time, left, right in boundary_examples[:5]:
+2513:                             self.log(
+2514:                                 self.t("log_boundary_example").format(
+2515:                                     split=split_time, left=left, right=right,
+2516:                                 )
+2517:                             )
+2518: 
+2519:                     if boundary_times:
+2520:                         segment_times = boundary_times
+2521:                         discard_smooth_segments = True
+2522:                     else:
+2523:                         self.log(self.t("log_no_boundary"))
+2524: 
+2525:                 expected_temp_segments = len(segment_times) + 1
+2526:                 total_scenes = (
+2527:                     sum(
+2528:                         1
+2529:                         for i in range(expected_temp_segments)
+2530:                         if i % 2 == 0
+2531:                     )
+2532:                     if discard_smooth_segments
+2533:                     else expected_temp_segments
+2534:                 )
+2535:                 segment_progress_start = 0.12
+2536: 
+2537:                 segment_command = self.build_scene_segment_command(
+2538:                     ffmpeg_path,
+2539:                     video_path,
+2540:                     temp_pattern,
+2541:                     segment_times,
+2542:                     max_seconds,
+2543:                     duration,
+2544:                     remove_audio,
+2545:                     hardware_type=self.hardware_type,
+2546:                 )
+2547: 
+
+
+--- build_scene_segment_command (Lines 2735-2838) ---
+2735:     def build_scene_segment_command(
+2736:         self,
+2737:         ffmpeg_path: str,
+2738:         video_path: Path,
+2739:         temp_pattern: Path,
+2740:         segment_times: list[float],
+2741:         max_seconds: float,
+2742:         duration: float,
+2743:         remove_audio: bool,
+2744:         hardware_type: str = "cpu"
+2745:     ) -> list[str]:
+2746:         # Khởi tạo khung xương lệnh gốc
+2747:         command = [
+2748:             ffmpeg_path,
+2749:             "-threads", "8",
+2750:             "-y",
+2751:             "-progress", "pipe:1",
+2752:             "-nostats",
+2753:         ]
+2754: 
+2755:         # --- RẼ NHÁNH TẬP LỆNH MÃ HÓA THEO THIẾT BỊ PHẦN CỨNG ---
+2756:         if hardware_type == "nvidia":
+2757:             # ── TRƯỜNG HỢP 1: MÁY SỬ DỤNG CARD NVIDIA NVENC ──
+2758:             command += [
+2759:                 "-hwaccel", "cuda",
+2760:                 "-hwaccel_output_format", "cuda",
+2761:                 "-i", str(video_path),
+2762:                 "-map", "0:v:0",
+2763:             ]
+2764:             if remove_audio: command += ["-an"]
+2765:             else: command += ["-map", "0:a?"]
+2766: 
+2767:             command += [
+2768:                 "-c:v", "h264_nvenc",
+2769:                 "-preset", "p4",             # Preset p4 cân bằng hoàn hảo tốc độ và độ sắc nét
+2770:                 "-tune", "hq",               # High Quality offline render
+2771:                 "-rc", "vbr",
+2772:                 "-cq", "22",                 # Constant Quality 22 cho chất lượng đỉnh cao
+2773:                 "-b:v", "25M",               # Bitrate mục tiêu 25M
+2774:                 "-maxrate", "50M",           # Trần tối đa 50M (Phục vụ hoàn hảo cho video 4K)
+2775:                 "-bufsize", "75M",           # Buffer size tối ưu
+2776:                 "-forced-idr", "1",
+2777:                 "-g", "60",
+2778:             ]
+2779:             if not remove_audio: command += ["-c:a", "copy"]
+2780: 
+2781:         elif hardware_type == "amd":
+2782:             # ── TRƯỜNG HỢP 2: MÁY SỬ DỤNG CARD AMD AMF ──
+2783:             command += [
+2784:                 "-hwaccel", "d3d11va",       # Tăng tốc phần cứng Direct3D tiêu chuẩn của AMD
+2785:                 "-i", str(video_path),
+2786:                 "-map", "0:v:0",
+2787:             ]
+2788:             if remove_audio: command += ["-an"]
+2789:             else: command += ["-map", "0:a?"]
+2790: 
+2791:             command += [
+2792:                 "-c:v", "h264_amf",
+2793:                 "-rc", "vbr_peak",           # Chế độ Peak VBR thông minh của AMD
+2794:                 "-quality", "quality",       # Đặt chất lượng render lên ưu tiên hàng đầu
+2795:                 "-b:v", "25M",
+2796:                 "-maxrate", "50M",           # Hỗ trợ bung băng thông cho video 4K sắc nét
+2797:                 "-forced-idr", "1",
+2798:                 "-g", "60",
+2799:             ]
+2800:             if not remove_audio: command += ["-c:a", "copy"]
+2801: 
+2802:         else:
+2803:             # ── TRƯỜNG HỢP 3: MÁY KHÔNG CÓ GPU HOẶC INTEL (DỰ PHÒNG AN TOÀN CPU) ──
+2804:             command += [
+2805:                 "-i", str(video_path),
+2806:                 "-map", "0:v:0",
+2807:             ]
+2808:             if remove_audio: command += ["-an"]
+2809:             else: command += ["-map", "0:a?"]
+2810: 
+2811:             # Sử dụng thư viện libx264 phần mềm, crf 22 giữ độ nét tương đương bản gốc
+2812:             command += [
+2813:                 "-c:v", "libx264",
+2814:                 "-preset", "veryfast",       # Đảm bảo tốc độ CPU không bị quá ì ạch
+2815:                 "-crf", "22",
+2816:             ]
+2817:             if not remove_audio: command += ["-c:a", "aac", "-b:a", "192k"] # Mã hóa audio an toàn bằng CPU
+2818: 
+2819:         # --- KHỐI LỆNH ĐỊNH HƯỚNG PHÂN CẢNH VÀ XUẤT ĐẦU RA PHÍA SAU GIỮ NGUYÊN ---
+2820:         command += ["-f", "segment"]
+2821:         if segment_times:
+2822:             command += [
+2823:                 "-segment_times", format_split_times(segment_times),
+2824:                 "-segment_time_delta", "0.05",
+2825:             ]
+2826:         else:
+2827:             command += ["-segment_time", str(max(duration + 1, max_seconds))]
+2828: 
+2829:         command += [
+2830:             "-reset_timestamps", "1",
+2831:             "-segment_start_number", "1",
+2832:             "-segment_format", "mp4",
+2833:             "-segment_format_options", "movflags=+faststart",
+2834:             str(temp_pattern),
+2835:         ]
+2836: 
+2837:         return command
+2838: 
+
+
