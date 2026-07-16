@@ -3061,12 +3061,17 @@ if __name__ == "__main__":
     QApplication.setHighDpiScaleFactorRoundingPolicy(Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
     app = QApplication(sys.argv)
 
+    # --- KHỞI TẠO LOGGING ---
+    from app_logging import setup_logging
+    setup_logging()
+    # ------------------------
+
     # --- CHỐT CHẶN BẢN QUYỀN ---
-    from security import check_license_on_startup
+    from security import check_license_on_startup, LicenseStatus
     from license_dialog import LicenseDialog
 
-    is_valid, _ = check_license_on_startup()
-    if not is_valid:
+    license_result = check_license_on_startup()
+    if license_result.valid is not True:
         dialog = LicenseDialog()
         if dialog.exec() != QDialog.DialogCode.Accepted:
             sys.exit(0)
@@ -3077,7 +3082,7 @@ if __name__ == "__main__":
 
     need_restart = run_update_check()
     if need_restart:
-        sys.exit(0)  # App sẽ được restart bởi batch script trong updater
+        sys.exit(0)  # App sẽ được restart bởi installer
     # ---------------------------
 
     window = VideoCutterApp()
