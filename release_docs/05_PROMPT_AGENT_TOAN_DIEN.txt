@@ -1,0 +1,110 @@
+﻿PROMPT DUY NHẤT CHO CODING AGENT
+================================
+
+CÁCH DÙNG
+---------
+Chỉ thay đúng một dòng ở đầu khối PROMPT BẮT ĐẦU: TÊN_DỰ_ÁN = "Video Cutter".
+Ví dụ áp dụng cho Audio Factory thì chỉ đổi thành TÊN_DỰ_ÁN = "Audio Factory".
+Không thay thêm app_id, tên EXE, tên thư mục AppData, tên bảng hoặc tên file ở bất cứ chỗ nào khác.
+Agent phải tự suy ra tên kỹ thuật chữ thường snake_case từ TÊN_DỰ_ÁN, nhưng nếu repo đã có giá trị
+đang được phát hành thì phải giữ giá trị cũ để không phá license, installer, shortcut hay update hiện có.
+
+PROMPT BẮT ĐẦU
+--------------
+TÊN_DỰ_ÁN = "Video Cutter"
+
+Bạn là coding agent chịu trách nhiệm xây dựng/chuẩn hóa toàn bộ nền tảng update, license, quản lý thiết bị,
+HWID ổn định, bảo vệ mã nguồn và đóng gói phát hành cho dự án có TÊN_DỰ_ÁN ở trên.
+
+TÊN_DỰ_ÁN là cấu hình đầu vào duy nhất. Tự suy ra các tên kỹ thuật cần thiết từ nó (app_id snake_case,
+tên EXE, thư mục AppData, logger, tên RPC...) nhưng trước hết phải đọc repository. Nếu các định danh này
+đã tồn tại trong bản phát hành thì phải giữ chúng; không được đổi tùy tiện vì có thể làm đứt update, AppId,
+license cũ hoặc shortcut của người dùng. Không sửa các tính năng nghiệp vụ/UI không liên quan.
+
+I. KHẢO SÁT VÀ QUY TẮC AN TOÀN
+1. Trước khi thay đổi, đọc cấu trúc source, version, entry point, luồng startup, build script, PyInstaller,
+   Inno Setup, dependencies, SQL, tests và thay đổi chưa commit. Báo cáo ngắn hiện trạng/rủi ro trước khi sửa.
+2. Không xóa, reset hoặc ghi đè thay đổi không liên quan. Không DROP bảng/cột chung khi chưa xác nhận mọi app
+   dùng chung database đã tương thích. Mọi migration phải idempotent và có rollback hoặc kế hoạch rollback.
+3. Không đưa Supabase service_role key, private signing key, .pfx, password, Drive OAuth token hay secret phát
+   hành vào source, EXE, installer, log hoặc tài liệu public. Anon key có thể ở client nhưng phải bị RLS/RPC giới hạn.
+4. Không được tắt kiểm tra hash, làm yếu RLS hay dùng dữ liệu hash giả để “cho chạy”. Nếu không thể kiểm thử,
+   phải nói rõ điều gì chưa được xác minh; không tuyên bố hoàn tất 100% không có bằng chứng.
+
+II. VERSION VÀ LUỒNG KHỞI ĐỘNG
+1. Chuẩn hóa version.py làm nguồn sự thật duy nhất cho APP_ID, APP_NAME, APP_VERSION và EXE_NAME.
+2. Entry point, updater, logger và installer phải đọc các giá trị này khi phù hợp. MyAppVersion của Inno Setup
+   phải trùng APP_VERSION. AppId Inno Setup giữ nguyên cho mọi bản cập nhật của cùng app.
+3. Startup đúng thứ tự: xác minh pending-update marker -> kiểm tra/kích hoạt license -> kiểm tra update -> mở UI.
+4. Chỉ chạy update check khi sys.frozen là true; không ép update hay gọi mạng khi chạy source/dev.
+
+III. HWID ỔN ĐỊNH VÀ LICENSE LOCAL
+1. Tạo HWID có version. Anchor chính là SMBIOS Product UUID từ Win32_ComputerSystemProduct.UUID. Loại bỏ UUID
+   rỗng, toàn 0/toàn f, “to be filled” và “default string”. Fallback duy nhất là MachineGuid Windows.
+2. Không dùng MAC, IP, tên máy, serial ổ đĩa, CPU ID hay tổ hợp giá trị biến động làm anchor chính.
+3. Chuẩn hóa material '<namespace_của_app>|<source>|<anchor_chữ_thường>', băm SHA-256 thành 64 ký tự hex.
+   Không gửi raw UUID phần cứng lên server.
+4. Cache DeviceIdentity bằng Windows DPAPI tại %APPDATA%\<App>\device_profile.dat với schema_version,
+   hwid_version, hwid, source. Cache không thay anchor; mất cache phải tái tạo cùng HWID nếu anchor còn.
+5. License local dùng DPAPI và ghi atomic (.tmp, flush/fsync, os.replace). Lưu key, HWID hash, version,
+   last_verified_at, last_seen_at, expiry cache, trạng thái server. Không ghi toàn bộ key/HWID trong log.
+6. Mỗi lần mở app phải cố gắng online verify. Chỉ cho offline grace ngắn sau một lần verify thành công và chỉ
+   khi lỗi là network/server. Không grace cho key mới, hết hạn, bị revoke, HWID sai hoặc cấu hình client sai.
+7. Nếu có HWID cũ, chỉ migration một lần sau khi license key được server xác thực; lưu hwid_version rõ ràng.
+
+IV. SUPABASE, RPC VÀ NHIỀU THIẾT BỊ
+1. Không để client SELECT/INSERT/UPDATE/DELETE trực tiếp bảng license. Viết SECURITY DEFINER RPC transaction
+   theo app để activate/verify license, nhận key, HWID v3, version, legacy candidates và app version.
+2. RPC bắt buộc kiểm tra key, is_active, expired_at, max_devices; khóa dòng bằng FOR UPDATE; nếu HWID đã tồn tại
+   thì thành công; nếu máy mới và số thiết bị nhỏ hơn max_devices thì thêm atomically; nếu đầy trả DEVICE_LIMIT.
+   Không được có race condition khi hai máy kích hoạt cùng lúc.
+3. Ưu tiên một bảng license đơn giản với device_hwids JSONB. Entry gồm hwid_hash, hwid_version, added_at,
+   last_seen_at. Cung cấp quy trình/câu SQL admin xóa đúng entry khi khách đổi máy.
+4. RLS chỉ cấp EXECUTE các RPC cần thiết cho anon/authenticated và thu hồi quyền table trực tiếp. Service-role
+   chỉ nằm ở backend/CI. Thêm test SQL cho max_devices=1/2, expired, revoke và máy cũ/máy mới.
+
+V. AUTO-UPDATE GOOGLE DRIVE AN TOÀN
+1. Dùng app_versions có app_id, latest_version, changelog, download_url, sha256, file_size, package_type,
+   enforcement, is_active, published_at. Mỗi app có đúng một dòng is_active=true.
+2. enforcement phải là PostgreSQL ENUM với đúng hai giá trị optional và forced để Table Editor hiện dropdown.
+   optional cho bỏ qua update; forced chỉ cho cập nhật hoặc thoát. Không dùng metadata mà code không thực sự enforce
+   để quyết định bắt buộc update.
+3. Client chỉ nhận full installer HTTPS với latest_version cao hơn current version, SHA-256 đúng 64 hex và
+   file_size nguyên dương. Cấu hình thiếu/sai phải được từ chối có log rõ ràng.
+4. Hỗ trợ Google Drive share URL /file/d/<id>/view và open?id=<id>. Tự lấy file ID, dùng download endpoint,
+   xử lý confirmation page của file lớn bằng cookie/form/link. Không cần tài khoản Google, không lưu token.
+5. Tải streaming vào thư mục temp riêng; tính SHA-256 khi tải; kiểm tra đủ số byte, SHA-256 và header MZ.
+   Hủy/lỗi/sai hash phải xóa file .part. Chỉ chạy installer đã qua mọi kiểm tra và chỉ từ thư mục update tin cậy.
+6. Trước cài đặt ghi pending marker DPAPI gồm source_version, target_version, expected_install_dir và installer path.
+   Chạy Inno silent với /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /CLOSEAPPLICATIONS /DIR=<current_install_dir>.
+   Lần mở sau chỉ xác nhận thành công nếu version VÀ install dir đều khớp; nếu sai xóa marker để tránh update loop.
+7. Không dùng link folder, không thay/revision artifact đã public, không dùng lại version đã phát hành, không tắt hash
+   check vì Google Drive trả HTML hoặc lỗi tải.
+
+VI. PYARMOR, PYINSTALLER, INNO SETUP VÀ CODE SIGNING
+1. Obfuscate các module nhạy cảm: security, device_identity, dpapi_storage, updater, license_dialog, version.
+   main.py có thể là entry plain nếu cần nhưng phải import module obfuscate từ staging.
+2. Build PyInstaller --onedir --windowed --clean --noconfirm; thêm --paths staging, --add-data assets/icon.
+3. Khai báo hidden imports đầy đủ: tất cả module protected, packaging, packaging.version, urllib.request,
+   urllib.error, urllib.parse, http.cookiejar, html.parser, winreg, ctypes, ctypes.wintypes và import động mới.
+   Mỗi lần thay đổi import trong module protected phải build clean.
+4. Inno Setup giữ AppId ổn định, UsePreviousAppDir=yes, copy toàn bộ dist, đóng EXE cũ đúng tên, shortcut/icon
+   đúng path. Updater phải truyền /DIR để ghi đè đúng thư mục bản cũ. Không đổi EXE_NAME tùy tiện.
+5. Khuyến nghị ký Authenticode cho EXE và installer. Tính SHA-256/file_size của installer sau ký số. PyArmor không
+   thay code signing và không thay server-side authorization.
+
+VII. KIỂM THỬ, RELEASE VÀ BÀN GIAO
+1. Chạy toàn bộ unit tests. Bổ sung test hợp lý cho parser version, SHA-256/file size/MZ, Drive file ID,
+   optional/forced và pending marker no-loop.
+2. Smoke test EXE frozen trong môi trường không có source, virtualenv hoặc PYTHONPATH dev.
+3. Test activation lần đầu, mở lại cùng máy, max_devices, máy thứ hai, expired/revoke, offline grace và
+   migration HWID cũ nếu áp dụng.
+4. Test Drive link ẩn danh, confirmation page file lớn nếu có thể, update từ bản cũ, silent cài đè đúng thư mục,
+   shortcut cũ, icon/assets và updater.log.
+5. Sau artifact cuối cùng, xuất SHA-256/file_size bằng PowerShell. Chỉ sau test thành công mới đề xuất câu SQL
+   UPDATE metadata release trên Supabase.
+6. Trả bàn giao theo đúng cấu trúc: (a) file đổi và lý do, (b) SQL migration + rollback/ghi chú, (c) lệnh build
+   từ clean workspace, (d) lệnh hash/size, (e) bằng chứng test thực tế, (f) rủi ro/phần chưa xác minh và hành động
+   người dùng cần làm. Không che giấu lỗi hay dùng kết quả suy đoán.
+
+KẾT THÚC PROMPT

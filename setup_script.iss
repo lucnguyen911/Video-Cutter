@@ -1,16 +1,12 @@
 ; ============================================================
 ; Video Cutter — Inno Setup Script
 ; ============================================================
-; Build command (with version from build_release.ps1):
-;   "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DMyAppVersion=1.0.1 setup_script.iss
-;
-; Or standalone (uses fallback dev version):
+; Build command:
 ;   "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" setup_script.iss
 ; ============================================================
 
-; Version from build command, fallback to dev version
 #ifndef MyAppVersion
-  #define MyAppVersion "0.0.0-dev"
+#define MyAppVersion "1.0.0"
 #endif
 
 #define MyAppName "Video Cutter"
@@ -19,7 +15,6 @@
 #define MyAppIcon "icon_scissors.ico"
 
 [Setup]
-; IMPORTANT: AppId must remain constant across all versions for upgrades to work
 AppId={{A3F7B2C1-9D4E-4A8B-B5E6-1C2D3E4F5A6B}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
@@ -37,8 +32,9 @@ PrivilegesRequired=admin
 UninstallDisplayIcon={app}\{#MyAppExeName}
 UninstallDisplayName={#MyAppName}
 CloseApplications=force
-; Only close our own executable — NOT *.exe (which would close everything!)
-CloseApplicationsFilter={#MyAppExeName}
+CloseApplicationsFilter=Video_Cutter.exe
+UsePreviousAppDir=yes
+RestartIfNeededByRun=no
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"

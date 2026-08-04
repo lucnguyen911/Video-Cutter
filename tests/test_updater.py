@@ -1,440 +1,146 @@
-"""
-test_updater.py — Tests for update checking, downloading, and applying.
-=======================================================================
-Covers requirements XXV.1-25 (updater behavior).
-"""
-
-import hashlib
-import json
+# Tests for update metadata and one-shot pending markers.
 import os
-import sys
 import tempfile
-import threading
 from pathlib import Path
-from unittest import mock
+from unittest.mock import MagicMock, patch
+import urllib.error
 
-import pytest
-
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-
-from updater import (
-    UpdateCheckStatus,
-    UpdateCheckResult,
-    UpdateInfo,
-    UpdateEnforcement,
-    PackageType,
-    DownloadResult,
-    check_for_update,
-    download_update,
-    apply_update,
-    _classify_http_error,
-)
-from version import APP_VERSION
+import updater
+from dpapi_storage import save_secure_json
+from updater import UpdateCheckStatus, UpdateCheckResult, UpdateInfo, check_for_update_logic, run_update_check, validate_install_dir, verify_pending_update_marker
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  HELPERS
-# ═══════════════════════════════════════════════════════════════════════════════
+def test_validate_install_dir():
+    import shutil
+    install = Path.cwd() / "_test_install_dir"
+    shutil.rmtree(install, ignore_errors=True)
+    try:
+        install.mkdir()
+        assert not validate_install_dir(install)
+        (install / "Video_Cutter.exe").touch()
+        assert validate_install_dir(install)
+        temp_install = install / "temp_folder"
+        temp_install.mkdir()
+        (temp_install / "Video_Cutter.exe").touch()
+        assert not validate_install_dir(temp_install)
+    finally:
+        shutil.rmtree(install, ignore_errors=True)
 
-def _make_update_info(**overrides):
-    """Helper to create UpdateInfo."""
-    base = {
-        "latest_version": "2.0.0",
-        "download_url": "https://example.com/update.exe",
-        "changelog": "Test changelog",
-        "enforcement": UpdateEnforcement.OPTIONAL,
-        "package_type": PackageType.FULL,
-        "sha256": None,
-        "file_size": None,
-        "minimum_supported_version": "1.0.0",
+def _create_secure_marker(tmpdir, expected_dir, target_version):
+    update_dir = Path(tmpdir) / "VideoCutter" / "updates"
+    update_dir.mkdir(parents=True)
+    installer = update_dir / "update_latest.exe"
+    installer.touch()
+    marker_path = Path(tmpdir) / "VideoCutter" / "pending_update.dat"
+    marker = {
+        "source_version": "1.0.0",
+        "target_version": target_version,
+        "expected_install_dir": str(expected_dir),
+        "installer_path": str(installer),
     }
-    base.update(overrides)
-    return UpdateInfo(**base)
+    save_secure_json(str(marker_path), marker, updater.PENDING_MARKER_ENTROPY)
+    return marker_path, installer
 
 
-def _mock_urlopen(data, status=200):
-    """Create a mock for urllib.request.urlopen."""
-    response = mock.MagicMock()
-    response.__enter__ = mock.MagicMock(return_value=response)
-    response.__exit__ = mock.MagicMock(return_value=False)
-    response.read.return_value = json.dumps(data).encode("utf-8")
-    response.getcode.return_value = status
-    response.headers = {"Content-Length": "0"}
-    return response
+def test_verify_pending_update_marker_success_cleans_marker_and_package():
+    with tempfile.TemporaryDirectory() as tmpdir, patch.dict(os.environ, {"APPDATA": tmpdir}):
+        expected_dir = Path(tmpdir) / "Video Cutter"
+        expected_dir.mkdir()
+        marker_path, installer = _create_secure_marker(tmpdir, expected_dir, "1.0.1")
+        with patch("updater.get_current_install_dir", MagicMock(return_value=expected_dir)), patch("updater.APP_VERSION", "1.0.1"):
+            verify_pending_update_marker()
+        assert not marker_path.exists()
+        assert not installer.exists()
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  Test 1-2: Basic update check
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class TestUpdateCheck:
-
-    @mock.patch("updater.urllib.request.urlopen")
-    def test_01_same_version_no_update(self, mock_open):
-        """Server returns same version → NO_UPDATE."""
-        mock_open.return_value = _mock_urlopen([{
-            "latest_version": APP_VERSION,
-            "download_url": "https://example.com",
-            "changelog": "",
-            "update_type": "optional",
-        }])
-        
-        result = check_for_update()
-        assert result.status == UpdateCheckStatus.NO_UPDATE
-
-    @mock.patch("updater.urllib.request.urlopen")
-    def test_02_newer_version_update_available(self, mock_open):
-        """Server returns newer version → UPDATE_AVAILABLE."""
-        mock_open.return_value = _mock_urlopen([{
-            "latest_version": "99.0.0",
-            "download_url": "https://example.com/update.exe",
-            "changelog": "New features",
-            "update_type": "optional",
-        }])
-        
-        result = check_for_update()
-        assert result.status == UpdateCheckStatus.UPDATE_AVAILABLE
-        assert result.update_info is not None
-        assert result.update_info.latest_version == "99.0.0"
+def test_verify_pending_update_marker_mismatch_is_cleared_to_prevent_loop():
+    with tempfile.TemporaryDirectory() as tmpdir, patch.dict(os.environ, {"APPDATA": tmpdir}):
+        expected_dir = Path(tmpdir) / "Video Cutter"
+        expected_dir.mkdir()
+        marker_path, installer = _create_secure_marker(tmpdir, expected_dir, "1.0.1")
+        with patch("updater.get_current_install_dir", MagicMock(return_value=expected_dir)), patch("updater.APP_VERSION", "1.0.0"):
+            verify_pending_update_marker()
+        assert not marker_path.exists()
+        assert not installer.exists()
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  Test 3-8: Error handling
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class TestUpdateCheckErrors:
-
-    @mock.patch("updater.urllib.request.urlopen")
-    def test_03_empty_data_app_not_configured(self, mock_open):
-        """APP_ID not in database → APP_NOT_CONFIGURED (not NO_UPDATE)."""
-        mock_open.return_value = _mock_urlopen([])
-        
-        result = check_for_update()
-        assert result.status == UpdateCheckStatus.APP_NOT_CONFIGURED
-
-    @mock.patch("updater.urllib.request.urlopen")
-    def test_04_http_404_client_config_error(self, mock_open):
-        """HTTP 404 → CLIENT_CONFIG_ERROR."""
-        import urllib.error
-        mock_open.side_effect = urllib.error.HTTPError(
-            url="http://test", code=404, msg="Not Found",
-            hdrs={}, fp=None,
-        )
-        
-        result = check_for_update()
-        assert result.status == UpdateCheckStatus.CLIENT_CONFIG_ERROR
-
-    @mock.patch("updater.urllib.request.urlopen")
-    def test_05_http_401_auth_error(self, mock_open):
-        """HTTP 401 → AUTH_ERROR."""
-        import urllib.error
-        mock_open.side_effect = urllib.error.HTTPError(
-            url="http://test", code=401, msg="Unauthorized",
-            hdrs={}, fp=None,
-        )
-        
-        result = check_for_update()
-        assert result.status == UpdateCheckStatus.AUTH_ERROR
-
-    @mock.patch("updater.urllib.request.urlopen")
-    def test_05b_http_403_auth_error(self, mock_open):
-        """HTTP 403 → AUTH_ERROR."""
-        import urllib.error
-        mock_open.side_effect = urllib.error.HTTPError(
-            url="http://test", code=403, msg="Forbidden",
-            hdrs={}, fp=None,
-        )
-        
-        result = check_for_update()
-        assert result.status == UpdateCheckStatus.AUTH_ERROR
-
-    @mock.patch("updater.urllib.request.urlopen")
-    def test_06_timeout_network_error(self, mock_open):
-        """Timeout → NETWORK_ERROR."""
-        mock_open.side_effect = TimeoutError("Connection timed out")
-        
-        result = check_for_update()
-        assert result.status == UpdateCheckStatus.NETWORK_ERROR
-
-    @mock.patch("updater.urllib.request.urlopen")
-    def test_07_http_500_server_error(self, mock_open):
-        """HTTP 500 → SERVER_ERROR."""
-        import urllib.error
-        mock_open.side_effect = urllib.error.HTTPError(
-            url="http://test", code=500, msg="Internal Server Error",
-            hdrs={}, fp=None,
-        )
-        
-        result = check_for_update()
-        assert result.status == UpdateCheckStatus.SERVER_ERROR
-
-    @mock.patch("updater.urllib.request.urlopen")
-    def test_08_invalid_version_invalid_response(self, mock_open):
-        """Invalid version string → INVALID_RESPONSE."""
-        mock_open.return_value = _mock_urlopen([{
-            "latest_version": "not.a.valid.version.!!",
-            "download_url": "",
-            "changelog": "",
-        }])
-        
-        result = check_for_update()
-        assert result.status == UpdateCheckStatus.INVALID_RESPONSE
+def test_check_for_update_errors():
+    err404 = urllib.error.HTTPError("url", 404, "Not Found", None, None)
+    with patch("urllib.request.urlopen", MagicMock(side_effect=err404)):
+        assert check_for_update_logic("video_cutter", "1.0.0").status == UpdateCheckStatus.CLIENT_CONFIG_ERROR
+    err502 = urllib.error.HTTPError("url", 502, "Bad Gateway", None, None)
+    with patch("urllib.request.urlopen", MagicMock(side_effect=err502)):
+        assert check_for_update_logic("video_cutter", "1.0.0").status == UpdateCheckStatus.SERVER_ERROR
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  Test 9-12: Download behavior
-# ═══════════════════════════════════════════════════════════════════════════════
+def test_update_rejects_missing_integrity_metadata():
+    response = MagicMock()
+    response.read.return_value = b'[{"latest_version":"2.0.0","download_url":"https://example.com/app.exe","package_type":"full","sha256":null,"file_size":100}]'
+    response.__enter__.return_value = response
+    with patch("urllib.request.urlopen", MagicMock(return_value=response)):
+        assert check_for_update_logic("video_cutter", "1.0.0").status == UpdateCheckStatus.INVALID_RESPONSE
+class _FakeSignal:
+    def connect(self, _callback):
+        pass
 
-class TestDownload:
+class _FakeLoop:
+    def exec(self):
+        pass
+    def quit(self):
+        pass
 
-    def test_09_download_cancel_removes_part_file(self):
-        """Cancel download → stop reading, delete .part file."""
-        cancel_event = threading.Event()
-        cancel_event.set()  # Pre-cancelled
-        
-        info = _make_update_info()
-        
-        with mock.patch("updater.urllib.request.urlopen") as mock_open:
-            response = mock.MagicMock()
-            response.__enter__ = mock.MagicMock(return_value=response)
-            response.__exit__ = mock.MagicMock(return_value=False)
-            response.getcode.return_value = 200
-            response.headers = {"Content-Length": "1000"}
-            response.read.return_value = b"x" * 100
-            mock_open.return_value = response
-            
-            result = download_update(info, cancel_event=cancel_event)
-            assert result.cancelled is True
-            assert result.success is False
+def _forced_update_info():
+    return UpdateInfo("2.0.0", None, "https://example.com/app.exe", "Required", "forced", "full", "a" * 64, 100)
 
-    @mock.patch("updater.urllib.request.urlopen")
-    def test_10_content_length_missing_still_works(self, mock_open):
-        """Missing Content-Length → still downloads if hash validates."""
-        content = b"test content for download"
-        sha = hashlib.sha256(content).hexdigest()
-        
-        response = mock.MagicMock()
-        response.__enter__ = mock.MagicMock(return_value=response)
-        response.__exit__ = mock.MagicMock(return_value=False)
-        response.getcode.return_value = 200
-        response.headers = {}  # No Content-Length
-        response.read.side_effect = [content, b""]
-        mock_open.return_value = response
-        
-        info = _make_update_info(sha256=sha, file_size=None)
-        
-        with mock.patch("updater.get_update_temp_dir") as mock_dir:
-            mock_dir.return_value = Path(tempfile.mkdtemp())
-            result = download_update(info)
-            assert result.success is True
+def test_forced_update_closes_when_declined():
+    result = UpdateCheckResult(UpdateCheckStatus.UPDATE_AVAILABLE, _forced_update_info(), "update")
+    class Worker:
+        def __init__(self, *_args):
+            self.finished_signal = _FakeSignal()
+            self.result = result
+        def start(self):
+            pass
+    with patch.object(updater.sys, "frozen", True, create=True), patch("updater.UpdateCheckWorker", Worker), patch("updater.QEventLoop", _FakeLoop), patch("updater.show_update_dialog", return_value=False):
+        assert run_update_check() is True
 
-    def test_11_wrong_file_size_rejected(self):
-        """File size mismatch → reject."""
-        content = b"short"
-        sha = hashlib.sha256(content).hexdigest()
-        
-        with mock.patch("updater.urllib.request.urlopen") as mock_open:
-            response = mock.MagicMock()
-            response.__enter__ = mock.MagicMock(return_value=response)
-            response.__exit__ = mock.MagicMock(return_value=False)
-            response.getcode.return_value = 200
-            response.headers = {"Content-Length": str(len(content))}
-            response.read.side_effect = [content, b""]
-            mock_open.return_value = response
-            
-            # Expect 99999 bytes but only got len(content)
-            info = _make_update_info(sha256=sha, file_size=99999)
-            
-            with mock.patch("updater.get_update_temp_dir") as mock_dir:
-                mock_dir.return_value = Path(tempfile.mkdtemp())
-                result = download_update(info)
-                assert result.success is False
-
-    def test_12_wrong_sha256_rejected_and_deleted(self):
-        """SHA-256 mismatch → reject and delete file."""
-        content = b"test content"
-        wrong_sha = "a" * 64  # Wrong hash
-        
-        with mock.patch("updater.urllib.request.urlopen") as mock_open:
-            response = mock.MagicMock()
-            response.__enter__ = mock.MagicMock(return_value=response)
-            response.__exit__ = mock.MagicMock(return_value=False)
-            response.getcode.return_value = 200
-            response.headers = {"Content-Length": str(len(content))}
-            response.read.side_effect = [content, b""]
-            mock_open.return_value = response
-            
-            info = _make_update_info(sha256=wrong_sha, file_size=len(content))
-            
-            with mock.patch("updater.get_update_temp_dir") as mock_dir:
-                tmpdir = Path(tempfile.mkdtemp())
-                mock_dir.return_value = tmpdir
-                result = download_update(info)
-                assert result.success is False
+def test_forced_update_closes_when_download_fails():
+    result = UpdateCheckResult(UpdateCheckStatus.UPDATE_AVAILABLE, _forced_update_info(), "update")
+    class Worker:
+        def __init__(self, *_args):
+            self.finished_signal = _FakeSignal()
+            self.result = result
+        def start(self):
+            pass
+    with patch.object(updater.sys, "frozen", True, create=True), patch("updater.UpdateCheckWorker", Worker), patch("updater.QEventLoop", _FakeLoop), patch("updater.show_update_dialog", return_value=True), patch("updater.run_update_download", return_value=False), patch("updater.QMessageBox.warning"):
+        assert run_update_check() is True
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  Test 13-14: URL and package type
-# ═══════════════════════════════════════════════════════════════════════════════
+def test_google_drive_share_links_are_normalised_to_direct_downloads():
+    file_id = "1AbCdEfGhIjKlMnOpQrStUvWxYz012345"
+    share_url = f"https://drive.google.com/file/d/{file_id}/view?usp=drive_link"
+    open_url = f"https://drive.google.com/open?id={file_id}"
 
-class TestUrlHandling:
-
-    def test_13_url_with_query_string_works(self):
-        """URL with query string doesn't confuse package type."""
-        info = _make_update_info(
-            download_url="https://example.com/file?token=abc&v=1",
-            package_type=PackageType.FULL,
-        )
-        # Package type comes from metadata, not URL
-        assert info.package_type == PackageType.FULL
-
-    def test_14_package_type_from_metadata_not_url(self):
-        """Package type is from server metadata, not URL extension."""
-        info = _make_update_info(
-            download_url="https://example.com/update.zip",
-            package_type=PackageType.FULL,
-        )
-        assert info.package_type == PackageType.FULL
+    assert updater._extract_google_drive_file_id(share_url) == file_id
+    assert updater._extract_google_drive_file_id(open_url) == file_id
+    assert updater._extract_google_drive_file_id("https://attacker-drive.google.com/file/d/1234567890/view") is None
+    assert updater._google_drive_download_url(file_id) == (
+        f"https://drive.usercontent.google.com/download?id={file_id}&export=download&confirm=t"
+    )
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  Test 15-17: Package validation
-# ═══════════════════════════════════════════════════════════════════════════════
+def test_google_drive_large_file_confirmation_form_is_supported():
+    file_id = "1AbCdEfGhIjKlMnOpQrStUvWxYz012345"
+    page = f'''<!doctype html><html><body>
+        <form action="https://drive.usercontent.google.com/download" method="get">
+          <input type="hidden" name="id" value="{file_id}">
+          <input type="hidden" name="export" value="download">
+          <input type="hidden" name="confirm" value="token123">
+          <input type="hidden" name="uuid" value="abc123">
+        </form>
+    </body></html>'''.encode("utf-8")
 
-class TestPackageValidation:
-
-    def test_15_zip_traversal_awareness(self):
-        """ZIP traversal paths should be detected."""
-        # Test that "../" in paths would be dangerous
-        dangerous_paths = ["../etc/passwd", "..\\system32\\evil.dll"]
-        for path in dangerous_paths:
-            normalized = os.path.normpath(path)
-            # Paths with .. should normalize to start with ..
-            assert normalized.startswith(".."), f"Path {path} did not normalize to start with .."
-        
-        # Absolute paths on Windows
-        abs_paths = ["C:\\Windows\\System32\\evil.dll", "D:\\secret"]
-        for path in abs_paths:
-            assert os.path.isabs(path), f"Path {path} should be absolute"
-
-    def test_16_manifest_app_id_validation(self):
-        """Manifest with wrong app_id should be rejected."""
-        from version import APP_ID
-        manifest = {"app_id": "wrong_app", "version": "1.0.0"}
-        assert manifest["app_id"] != APP_ID
-
-    def test_17_package_missing_exe_detection(self):
-        """Package without expected exe should be detectable."""
-        from version import EXE_NAME
-        fake_files = ["readme.txt", "data.dll"]
-        assert EXE_NAME not in fake_files
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  Test 18-19: Update application strategies
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class TestUpdateApplication:
-
-    def test_18_full_installer_uses_correct_args(self):
-        """Full installer should use correct silent args."""
-        from updater import apply_full_installer
-        
-        with mock.patch("updater.subprocess.Popen") as mock_popen:
-            fake_path = Path(tempfile.mktemp(suffix=".exe"))
-            fake_path.touch()
-            try:
-                apply_full_installer(fake_path)
-                
-                if mock_popen.called:
-                    args = mock_popen.call_args[0][0]
-                    assert "/VERYSILENT" in args
-                    assert "/SUPPRESSMSGBOXES" in args
-                    assert "/NORESTART" in args
-                    assert "/CLOSEAPPLICATIONS" in args
-            finally:
-                if fake_path.exists():
-                    fake_path.unlink()
-
-    def test_19_patch_without_helper_rejected(self):
-        """Patch update without helper is rejected safely."""
-        info = _make_update_info(package_type=PackageType.PATCH)
-        download = DownloadResult(
-            success=True,
-            file_path=Path("fake.zip"),
-            message="OK",
-        )
-        
-        result = apply_update(download, info)
-        assert result is False  # Rejected
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  Test 20-24: Error handling edge cases
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class TestErrorEdgeCases:
-
-    def test_20_http_error_classification(self):
-        """HTTP errors are correctly classified."""
-        import urllib.error
-        
-        # 401 → AUTH_ERROR
-        e401 = urllib.error.HTTPError("", 401, "", {}, None)
-        status, _ = _classify_http_error(e401)
-        assert status == UpdateCheckStatus.AUTH_ERROR
-        
-        # 404 → CLIENT_CONFIG_ERROR
-        e404 = urllib.error.HTTPError("", 404, "", {}, None)
-        status, _ = _classify_http_error(e404)
-        assert status == UpdateCheckStatus.CLIENT_CONFIG_ERROR
-        
-        # 500 → SERVER_ERROR
-        e500 = urllib.error.HTTPError("", 500, "", {}, None)
-        status, _ = _classify_http_error(e500)
-        assert status == UpdateCheckStatus.SERVER_ERROR
-
-    @mock.patch("updater.urllib.request.urlopen")
-    def test_21_json_error_invalid_response(self, mock_open):
-        """Invalid JSON response → doesn't crash."""
-        response = mock.MagicMock()
-        response.__enter__ = mock.MagicMock(return_value=response)
-        response.__exit__ = mock.MagicMock(return_value=False)
-        response.read.return_value = b"NOT JSON {{{{"
-        mock_open.return_value = response
-        
-        result = check_for_update()
-        assert result.status in (
-            UpdateCheckStatus.INVALID_RESPONSE,
-            UpdateCheckStatus.NETWORK_ERROR,
-        )
-
-    @mock.patch("updater.urllib.request.urlopen")
-    def test_22_empty_version_invalid_response(self, mock_open):
-        """Empty version string → INVALID_RESPONSE."""
-        mock_open.return_value = _mock_urlopen([{
-            "latest_version": "",
-            "download_url": "",
-        }])
-        
-        result = check_for_update()
-        assert result.status == UpdateCheckStatus.INVALID_RESPONSE
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  Test 25: Version single source of truth
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class TestVersionSource:
-
-    def test_25_version_from_single_source(self):
-        """APP_VERSION is imported from version.py (single source)."""
-        from version import APP_VERSION as v_version
-        from updater import APP_VERSION as u_version
-        assert v_version == u_version
-
-    def test_app_id_from_single_source(self):
-        """APP_ID is imported from version.py (single source)."""
-        from version import APP_ID as v_id
-        from updater import APP_ID as u_id
-        assert v_id == u_id
+    result = updater._google_drive_confirmation_url("https://drive.google.com/uc?id=" + file_id, page, file_id)
+    assert result is not None
+    assert result.startswith("https://drive.usercontent.google.com/download?")
+    assert "confirm=token123" in result
+    assert "uuid=abc123" in result

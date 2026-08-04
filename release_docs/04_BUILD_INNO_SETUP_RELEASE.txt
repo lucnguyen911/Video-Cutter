@@ -1,0 +1,34 @@
+﻿BUILD VÀ ĐÓNG GÓI INNO SETUP KHÔNG LỖI UPDATE
+=============================================
+
+Nguồn version duy nhất
+- version.py chứa APP_ID, APP_NAME, APP_VERSION, EXE_NAME.
+- setup_script.iss có MyAppVersion trùng APP_VERSION.
+- Giữ nguyên AppId Inno Setup giữa mọi version của cùng app. Đổi AppId là cài app mới và dễ gây update loop.
+
+Quy trình build
+1. Tăng version code và Inno cùng lúc.
+2. Chạy .venv\Scripts\python.exe build_protected.py từ root source.
+3. Xác nhận dist\<App>\<EXE_NAME> tồn tại và mở được.
+4. Build installer: & 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe' setup_script.iss
+5. Chỉ phát hành installer_output\<Tên>_Setup_v<version>.exe.
+6. Nếu ký số, ký EXE/installer rồi mới tính SHA-256/file_size.
+
+Yêu cầu Inno Setup
+- [Files] copy toàn bộ dist\<App>\* với recursesubdirs createallsubdirs.
+- UsePreviousAppDir=yes.
+- Updater truyền /DIR=<current_install_dir> để silent update ghi đè đúng nơi.
+- CloseApplications và CloseApplicationsFilter trỏ đúng EXE.
+- Icon runtime phải trong dist; shortcut trỏ đúng icon tại {app}.
+- Không đổi EXE_NAME tùy tiện trong luồng update.
+
+Checklist release
+1. Unit tests pass và frozen EXE chạy trên môi trường sạch.
+2. Test activation, reopen, offline grace, max_devices.
+3. Test optional/forced update từ bản cũ, silent in-place install và shortcut cũ.
+4. Kiểm tra updater.log/pending marker: lỗi phải xóa marker, không loop.
+5. Hash/size installer cuối, upload Drive, kiểm tra ẩn danh, sau đó mới cập nhật Supabase.
+
+Lỗi thường gặp: No module named X => thêm hidden import/build clean. Vẫn báo update => version code/Inno khác nhau, /DIR sai hoặc marker không khớp. Icon lỗi => thiếu --add-data hoặc resource_path sys._MEIPASS. SmartScreen => ký Authenticode, không làm yếu kiểm tra update.
+
+Lưu nội bộ artifact, hash, size, ngày phát hành, changelog, Drive file ID và commit/tag. Không sửa artifact đã public.

@@ -1,0 +1,23 @@
+﻿BẢO VỆ MÃ NGUỒN: PYARMOR, PYINSTALLER VÀ CODE SIGNING
+======================================================
+
+Python trong EXE vẫn có thể bị phân tích. PyArmor + PyInstaller làm việc dịch ngược khó hơn nhưng không thể cất bí mật tuyệt đối. Không nhúng service-role key, private key, .pfx, password hoặc token Drive vào artifact.
+
+Module nên obfuscate: security.py, device_identity.py, dpapi_storage.py, updater.py, license_dialog.py, version.py. main.py có thể là entry plain nếu giới hạn PyArmor, nhưng phải import module obfuscate từ staging.
+
+Pattern build
+1. Xóa build/obfuscated cũ.
+2. pyarmor gen -O build/obfuscated cho module nhạy cảm.
+3. Copy main.py vào staging.
+4. PyInstaller --clean --noconfirm --onedir --windowed, --paths trỏ staging và --add-data cho asset/icon.
+5. Dùng hidden imports cho toàn bộ module protected và import động.
+
+Hidden imports thường bắt buộc: security, device_identity, dpapi_storage, updater, license_dialog, version; packaging, packaging.version; urllib.request, urllib.error, urllib.parse; http.cookiejar, html.parser; winreg; ctypes; ctypes.wintypes.
+
+PyInstaller không luôn thấy import phía trong module PyArmor. Thiếu hidden import tạo lỗi EXE như “No module named urllib.request” hoặc “No module named version” dù source chạy. Mỗi import mới trong module protected phải thêm hidden import và build clean.
+
+Kiểm thử: chạy unit tests; chạy EXE frozen ở môi trường không source/venv/PYTHONPATH dev; test license, HWID, update, Drive, icon, popup và logs; không nuốt exception rỗng.
+
+Nên ký Authenticode cả EXE và installer. Tính SHA-256 sau ký số. Code signing không thay SHA-256 của updater, và PyArmor không thay server-side authorization.
+
+Không đóng gói source tree, test, .env, SQL admin, .pfx hoặc release key vào dist. Không tắt hash check để vượt lỗi Drive.

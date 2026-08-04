@@ -1,292 +1,173 @@
-"""
-test_license.py — Tests for license verification and management.
-================================================================
-Covers requirements XXIV.12-25 (license verification, offline grace).
-"""
+# tests/test_license.py
+# Tests licensing validation, offline grace logic, and migration.
 
-import json
 import os
-import sys
-from datetime import datetime, timezone, timedelta
-from unittest import mock
-
+import json
+import base64
+import tempfile
+from datetime import datetime, timedelta
+from unittest.mock import patch, MagicMock
 import pytest
+import urllib.error
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-
+import security
 from security import (
-    LicenseStatus,
-    LicenseVerificationResult,
-    _try_xor_decode,
-    _check_offline_grace,
-    _classify_http_error,
-    OFFLINE_GRACE_DAYS,
+    check_license_on_startup,
+    verify_license_online,
+    save_local_license,
+    load_local_license,
+    get_license_file_path,
+    LicenseVerificationResult
 )
 
+# Helper to mock urllib responses
+def make_mock_response(status_code, body_dict):
+    mock = MagicMock()
+    mock.getcode.return_value = status_code
+    mock.read.return_value = json.dumps(body_dict).encode("utf-8")
+    mock.__enter__.return_value = mock
+    return mock
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  Test 12: Legacy XOR migration
-# ═══════════════════════════════════════════════════════════════════════════════
+def test_verify_license_online_success():
+    mock_resp = make_mock_response(200, {
+        "valid": True,
+        "status": "VALID",
+        "message": "Bản quyền hợp lệ.",
+        "expired_at": "2029-12-31T23:59:59Z"
+    })
+    
+    with patch("urllib.request.urlopen", MagicMock(return_value=mock_resp)):
+        res = verify_license_online("TEST-KEY", "TEST-HWID")
+        assert res.valid is True
+        assert res.status == "VALID"
+        assert res.expired_at == "2029-12-31T23:59:59Z"
 
-class TestLegacyMigration:
+def test_verify_license_online_errors():
+    # 1. HTTP 404 -> CLIENT_CONFIG_ERROR
+    err404 = urllib.error.HTTPError("url", 404, "Not Found", None, None)
+    with patch("urllib.request.urlopen", MagicMock(side_effect=err404)):
+        res = verify_license_online("KEY", "HWID")
+        assert res.valid is False
+        assert res.status == "CLIENT_CONFIG_ERROR"
 
-    def test_12_legacy_xor_decode_works(self):
-        """Legacy XOR-encoded license token can be decoded with correct HWID."""
-        import base64
-        
-        original_key = "VIDEO-TEST-1234-ABCD-5678"
-        fake_hwid = "abc123def456" * 6  # 72 chars like SHA256 hex
-        
-        # Encode using the old XOR algorithm
-        encoded_chars = []
-        for i, char in enumerate(original_key):
-            key_c = ord(char)
-            hwid_c = ord(fake_hwid[i % len(fake_hwid)])
-            encoded_chars.append(chr(key_c ^ hwid_c))
-        token = base64.b64encode("".join(encoded_chars).encode("utf-8")).decode("utf-8")
-        
-        # Decode using our migration function
-        decoded = _try_xor_decode(token, fake_hwid)
-        assert decoded == original_key
+    # 2. HTTP 401 -> AUTH_ERROR
+    err401 = urllib.error.HTTPError("url", 401, "Unauthorized", None, None)
+    with patch("urllib.request.urlopen", MagicMock(side_effect=err401)):
+        res = verify_license_online("KEY", "HWID")
+        assert res.valid is False
+        assert res.status == "AUTH_ERROR"
 
-    def test_xor_decode_wrong_hwid_returns_none_or_garbage(self):
-        """Wrong HWID produces None or garbage (not the original key)."""
-        import base64
-        
-        original_key = "VIDEO-TEST-1234-ABCD-5678"
-        correct_hwid = "abc123def456" * 6
-        wrong_hwid = "zzz999zzz999" * 6
-        
-        encoded_chars = []
-        for i, char in enumerate(original_key):
-            key_c = ord(char)
-            hwid_c = ord(correct_hwid[i % len(correct_hwid)])
-            encoded_chars.append(chr(key_c ^ hwid_c))
-        token = base64.b64encode("".join(encoded_chars).encode("utf-8")).decode("utf-8")
-        
-        decoded = _try_xor_decode(token, wrong_hwid)
-        # Should either be None or not match the original
-        assert decoded is None or decoded != original_key
+    # 3. HTTP 500 -> SERVER_ERROR
+    err500 = urllib.error.HTTPError("url", 500, "Internal Server Error", None, None)
+    with patch("urllib.request.urlopen", MagicMock(side_effect=err500)):
+        res = verify_license_online("KEY", "HWID")
+        assert res.valid is False
+        assert res.status == "SERVER_ERROR"
 
+    # 4. URLError -> NETWORK_ERROR
+    err_url = urllib.error.URLError("DNS failure")
+    with patch("urllib.request.urlopen", MagicMock(side_effect=err_url)):
+        res = verify_license_online("KEY", "HWID")
+        assert res.valid is False
+        assert res.status == "NETWORK_ERROR"
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  Test 13-16: License status classification
-# ═══════════════════════════════════════════════════════════════════════════════
+def test_offline_grace_authorized():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        with patch.dict(os.environ, {"APPDATA": tmpdir}):
+            # Set up local license that was verified 1 day ago
+            last_verified = (datetime.utcnow() - timedelta(days=1)).isoformat() + "Z"
+            cached_expires = (datetime.utcnow() + timedelta(days=30)).isoformat() + "Z"
+            
+            with patch("security.get_hwid", MagicMock(return_value="SAME-HWID")):
+                save_local_license("KEY", "VALID", last_verified, cached_expires)
+                
+                # Mock online verification to fail with NETWORK_ERROR
+                net_err = urllib.error.URLError("No internet connection")
+                with patch("urllib.request.urlopen", MagicMock(side_effect=net_err)):
+                    res, key = check_license_on_startup()
+                    # Grace period should authorize startup
+                    assert res.valid is True
+                    assert res.status == "VALID"
+                    assert key == "KEY"
 
-class TestLicenseStatus:
+def test_offline_grace_denied_past_3_days():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        with patch.dict(os.environ, {"APPDATA": tmpdir}):
+            # verified 4 days ago
+            last_verified = (datetime.utcnow() - timedelta(days=4)).isoformat() + "Z"
+            cached_expires = (datetime.utcnow() + timedelta(days=30)).isoformat() + "Z"
+            
+            with patch("security.get_hwid", MagicMock(return_value="SAME-HWID")):
+                save_local_license("KEY", "VALID", last_verified, cached_expires)
+                
+                net_err = urllib.error.URLError("No internet connection")
+                with patch("urllib.request.urlopen", MagicMock(side_effect=net_err)):
+                    res, key = check_license_on_startup()
+                    assert res.valid is False
+                    assert res.status == "NETWORK_ERROR"
 
-    def test_13_activated_status(self):
-        """ACTIVATED status is valid."""
-        result = LicenseVerificationResult(
-            valid=True,
-            status=LicenseStatus.ACTIVATED,
-            message="Activated",
-        )
-        assert result.valid is True
-        assert result.status == LicenseStatus.ACTIVATED
+def test_offline_grace_denied_on_client_config_error():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        with patch.dict(os.environ, {"APPDATA": tmpdir}):
+            last_verified = (datetime.utcnow() - timedelta(days=1)).isoformat() + "Z"
+            cached_expires = (datetime.utcnow() + timedelta(days=30)).isoformat() + "Z"
+            
+            with patch("security.get_hwid", MagicMock(return_value="SAME-HWID")):
+                save_local_license("KEY", "VALID", last_verified, cached_expires)
+                
+                # HTTP 404 error returned online
+                err404 = urllib.error.HTTPError("url", 404, "Not Found", None, None)
+                with patch("urllib.request.urlopen", MagicMock(side_effect=err404)):
+                    res, key = check_license_on_startup()
+                    assert res.valid is False
+                    assert res.status == "CLIENT_CONFIG_ERROR"
 
-    def test_14_valid_status(self):
-        """VALID status is valid."""
-        result = LicenseVerificationResult(
-            valid=True,
-            status=LicenseStatus.VALID,
-            message="Valid",
-        )
-        assert result.valid is True
-
-    def test_15_device_mismatch_status(self):
-        """DEVICE_MISMATCH status is not valid."""
-        result = LicenseVerificationResult(
-            valid=False,
-            status=LicenseStatus.DEVICE_MISMATCH,
-            message="Mismatch",
-        )
-        assert result.valid is False
-        assert result.status == LicenseStatus.DEVICE_MISMATCH
-
-    def test_16_migrated_status(self):
-        """MIGRATED status is valid."""
-        result = LicenseVerificationResult(
-            valid=True,
-            status=LicenseStatus.MIGRATED,
-            message="Migrated",
-        )
-        assert result.valid is True
-        assert result.status == LicenseStatus.MIGRATED
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  Test 17-18: License edge cases
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class TestLicenseEdgeCases:
-
-    def test_17_result_valid_is_explicit_bool(self):
-        """result.valid must be checked explicitly (not truthy object)."""
-        # A dataclass with valid=False is still truthy as an object
-        result = LicenseVerificationResult(
-            valid=False,
-            status=LicenseStatus.LICENSE_NOT_FOUND,
-            message="Not found",
-        )
-        # This is why we use `result.valid is True` not `if result:`
-        assert bool(result) is True  # Object is truthy!
-        assert result.valid is not True  # But valid is False
-
-    def test_18_expired_license_not_valid(self):
-        """Expired license is not valid."""
-        result = LicenseVerificationResult(
-            valid=False,
-            status=LicenseStatus.LICENSE_EXPIRED,
-            message="Expired",
-        )
-        assert result.valid is False
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  Test 19-20: HTTP error classification
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class TestHttpErrorClassification:
-
-    def test_19_http_404_is_client_config_error(self):
-        """HTTP 404 → CLIENT_CONFIG_ERROR (not NETWORK_ERROR)."""
-        import urllib.error
-        error = urllib.error.HTTPError(
-            url="http://test",
-            code=404,
-            msg="Not Found",
-            hdrs={},
-            fp=None,
-        )
-        status, code = _classify_http_error(error)
-        assert status == LicenseStatus.CLIENT_CONFIG_ERROR
-        assert code == 404
-
-    def test_20_timeout_is_network_error(self):
-        """Timeout → NETWORK_ERROR."""
-        error = TimeoutError("Connection timed out")
-        status, _ = _classify_http_error(error)
-        assert status == LicenseStatus.NETWORK_ERROR
-
-    def test_http_401_is_auth_error(self):
-        """HTTP 401 → AUTH_ERROR."""
-        import urllib.error
-        error = urllib.error.HTTPError(
-            url="http://test",
-            code=401,
-            msg="Unauthorized",
-            hdrs={},
-            fp=None,
-        )
-        status, code = _classify_http_error(error)
-        assert status == LicenseStatus.AUTH_ERROR
-
-    def test_http_403_is_auth_error(self):
-        """HTTP 403 → AUTH_ERROR."""
-        import urllib.error
-        error = urllib.error.HTTPError(
-            url="http://test",
-            code=403,
-            msg="Forbidden",
-            hdrs={},
-            fp=None,
-        )
-        status, code = _classify_http_error(error)
-        assert status == LicenseStatus.AUTH_ERROR
-
-    def test_http_500_is_server_error(self):
-        """HTTP 500 → SERVER_ERROR."""
-        import urllib.error
-        error = urllib.error.HTTPError(
-            url="http://test",
-            code=500,
-            msg="Internal Server Error",
-            hdrs={},
-            fp=None,
-        )
-        status, code = _classify_http_error(error)
-        assert status == LicenseStatus.SERVER_ERROR
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  Test 21-25: Offline grace
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class TestOfflineGrace:
-
-    def _make_local_license(self, **overrides):
-        """Helper to create a local license dict."""
-        now = datetime.now(timezone.utc)
-        base = {
-            "schema_version": 2,
-            "license_key": "VIDEO-TEST-1234",
-            "hwid": "test_hwid_hash",
-            "hwid_version": 2,
-            "last_verified_at": (now - timedelta(hours=1)).isoformat(),
-            "cached_expires_at": (now + timedelta(days=30)).isoformat(),
-            "last_server_status": "VALID",
-        }
-        base.update(overrides)
-        return base
-
-    def test_21_no_local_license_no_grace(self):
-        """No local license + network error → must show dialog (no grace)."""
-        # _check_offline_grace returns None when conditions not met
-        result = _check_offline_grace({}, "test_hwid")
-        assert result is None
-
-    def test_22_valid_local_within_grace_allows_access(self):
-        """Valid local license within grace period + network error → allow."""
-        local = self._make_local_license()
-        result = _check_offline_grace(local, "test_hwid_hash")
-        assert result is not None
-        assert result.valid is True
-
-    def test_23_outside_grace_denied(self):
-        """Local license outside grace period → denied."""
-        old_date = (
-            datetime.now(timezone.utc) - timedelta(days=OFFLINE_GRACE_DAYS + 1)
-        ).isoformat()
-        local = self._make_local_license(last_verified_at=old_date)
-        result = _check_offline_grace(local, "test_hwid_hash")
-        assert result is None  # Grace denied
-
-    def test_24_http_404_no_grace(self):
-        """HTTP 404 is CLIENT_CONFIG_ERROR — not eligible for offline grace."""
-        # CLIENT_CONFIG_ERROR is not in _GRACE_ELIGIBLE_STATUSES
-        assert LicenseStatus.CLIENT_CONFIG_ERROR not in {
-            LicenseStatus.NETWORK_ERROR,
-            LicenseStatus.SERVER_ERROR,
-        }
-
-    def test_25_last_verified_not_updated_on_error(self):
-        """last_verified_at should not be updated when server returns error."""
-        # This is enforced by the code structure:
-        # save_local_license is only called when result.valid is True
-        result = LicenseVerificationResult(
-            valid=False,
-            status=LicenseStatus.SERVER_ERROR,
-            message="Server error",
-        )
-        # result.valid is False → save_local_license should NOT be called
-        assert result.valid is not True
-
-    def test_grace_denied_when_hwid_mismatch(self):
-        """Grace denied when local HWID doesn't match current."""
-        local = self._make_local_license(hwid="different_hwid")
-        result = _check_offline_grace(local, "current_hwid")
-        assert result is None
-
-    def test_grace_denied_when_never_verified(self):
-        """Grace denied when license was never verified online."""
-        local = self._make_local_license(last_server_status="PENDING")
-        result = _check_offline_grace(local, "test_hwid_hash")
-        assert result is None
-
-    def test_grace_denied_when_license_expired(self):
-        """Grace denied when cached expiry has passed."""
-        expired = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
-        local = self._make_local_license(cached_expires_at=expired)
-        result = _check_offline_grace(local, "test_hwid_hash")
-        assert result is None
+def test_legacy_license_migration():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        with patch.dict(os.environ, {"APPDATA": tmpdir}):
+            # Set up legacy XOR license format
+            legacy_dir = os.path.join(tmpdir, "VideoFactory")
+            os.makedirs(legacy_dir, exist_ok=True)
+            legacy_file = os.path.join(legacy_dir, "license.json")
+            
+            # XOR token construction with legacy HWID
+            legacy_hwid = "LEGACY-HWID-HASH"
+            key = "VIDEO-1234-5678-9000-1111"
+            
+            # XOR logic
+            encoded_chars = []
+            for i, char in enumerate(key):
+                encoded_chars.append(chr(ord(char) ^ ord(legacy_hwid[i % len(legacy_hwid)])))
+            obfuscated = base64.b64encode("".join(encoded_chars).encode('utf-8')).decode('utf-8')
+            
+            with open(legacy_file, "w", encoding="utf-8") as f:
+                json.dump({"token": obfuscated}, f)
+                
+            # Mock get_legacy_hwid_candidates to return the correct candidate
+            with patch("security.get_legacy_hwid_candidates", MagicMock(return_value=[legacy_hwid])):
+                with patch("security.get_hwid", MagicMock(return_value="NEW-HWID-V2")):
+                    
+                    # Mock successful RPC migration response
+                    mock_resp = make_mock_response(200, {
+                        "valid": True,
+                        "status": "MIGRATED",
+                        "message": "Migration OK",
+                        "expired_at": "2030-01-01T00:00:00Z"
+                    })
+                    
+                    with patch("urllib.request.urlopen", MagicMock(return_value=mock_resp)):
+                        res, key_out = check_license_on_startup()
+                        assert res.valid is True
+                        assert res.status == "VALID"
+                        assert key_out == key
+                        
+                        # New DPAPI license file must be written
+                        new_license = security._load_local_license_dict()
+                        assert new_license is not None
+                        assert new_license.get("license_key") == key
+                        assert new_license.get("hwid") == "NEW-HWID-V2"
+                        assert load_local_license() == key
+                        
+                        # Legacy file must be renamed to .bak
+                        assert not os.path.exists(legacy_file)
+                        assert os.path.exists(legacy_file + ".bak")

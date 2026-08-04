@@ -1,273 +1,142 @@
-"""
-dpapi_storage.py — Windows DPAPI wrapper using ctypes.
-======================================================
-Provides CryptProtectData / CryptUnprotectData for securing
-device profiles and license data locally.
+# dpapi_storage.py
+# Provides secure Windows DPAPI storage capabilities and atomic file operations.
 
-Uses ctypes directly — no heavy external dependencies.
-"""
-
-import ctypes
-import ctypes.wintypes
-import json
-import logging
 import os
+import json
+import ctypes
+from ctypes import wintypes
 from typing import Optional
 
-logger = logging.getLogger("security")
+# Load Crypt32.dll
+crypt32 = ctypes.windll.crypt32
+kernel32 = ctypes.windll.kernel32
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  DPAPI CONSTANTS & STRUCTURES
-# ═══════════════════════════════════════════════════════════════════════════════
-
-DEVICE_PROFILE_ENTROPY = b"VideoCutter-DeviceProfile-v2"
-LICENSE_ENTROPY = b"VideoCutter-License-v2"
-
-# CRYPTPROTECT flags
-CRYPTPROTECT_UI_FORBIDDEN = 0x01
-CRYPTPROTECT_LOCAL_MACHINE = 0x04
-
-
+# Define DATA_BLOB
 class DATA_BLOB(ctypes.Structure):
     _fields_ = [
-        ("cbData", ctypes.wintypes.DWORD),
-        ("pbData", ctypes.POINTER(ctypes.c_char)),
+        ("cbData", wintypes.DWORD),
+        ("pbData", ctypes.POINTER(ctypes.c_byte))
     ]
 
+CRYPTPROTECT_UI_FORBIDDEN = 0x01
 
-_crypt32 = ctypes.windll.crypt32
-_kernel32 = ctypes.windll.kernel32
-
-_CryptProtectData = _crypt32.CryptProtectData
-_CryptProtectData.argtypes = [
-    ctypes.POINTER(DATA_BLOB),  # pDataIn
-    ctypes.c_wchar_p,           # szDataDescr
-    ctypes.POINTER(DATA_BLOB),  # pOptionalEntropy
-    ctypes.c_void_p,            # pvReserved
-    ctypes.c_void_p,            # pPromptStruct
-    ctypes.wintypes.DWORD,      # dwFlags
-    ctypes.POINTER(DATA_BLOB),  # pDataOut
-]
-_CryptProtectData.restype = ctypes.wintypes.BOOL
-
-_CryptUnprotectData = _crypt32.CryptUnprotectData
-_CryptUnprotectData.argtypes = [
-    ctypes.POINTER(DATA_BLOB),  # pDataIn
-    ctypes.POINTER(ctypes.c_wchar_p),  # ppszDataDescr
-    ctypes.POINTER(DATA_BLOB),  # pOptionalEntropy
-    ctypes.c_void_p,            # pvReserved
-    ctypes.c_void_p,            # pPromptStruct
-    ctypes.wintypes.DWORD,      # dwFlags
-    ctypes.POINTER(DATA_BLOB),  # pDataOut
-]
-_CryptUnprotectData.restype = ctypes.wintypes.BOOL
-
-_LocalFree = _kernel32.LocalFree
-_LocalFree.argtypes = [ctypes.c_void_p]
-_LocalFree.restype = ctypes.c_void_p
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  DPAPI CORE FUNCTIONS
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def _make_blob(data: bytes) -> DATA_BLOB:
-    """Create a DATA_BLOB from bytes."""
-    blob = DATA_BLOB()
-    blob.cbData = len(data)
-    blob.pbData = ctypes.cast(ctypes.create_string_buffer(data, len(data)),
-                              ctypes.POINTER(ctypes.c_char))
-    return blob
-
-
-def dpapi_encrypt(plaintext: bytes, entropy: bytes = b"") -> bytes:
-    """
-    Encrypt data using Windows DPAPI (CryptProtectData).
+def protect_data(data: bytes, entropy: bytes = None) -> bytes:
+    """Encrypts bytes data using Windows DPAPI CryptProtectData."""
+    if not isinstance(data, bytes):
+        raise TypeError("Data must be bytes")
+        
+    data_in = DATA_BLOB()
+    data_in.cbData = len(data)
+    data_in.pbData = ctypes.cast(ctypes.create_string_buffer(data), ctypes.POINTER(ctypes.c_byte))
     
-    Args:
-        plaintext: Data to encrypt.
-        entropy: Optional entropy for additional protection.
+    entropy_in = None
+    if entropy:
+        entropy_in = DATA_BLOB()
+        entropy_in.cbData = len(entropy)
+        entropy_in.pbData = ctypes.cast(ctypes.create_string_buffer(entropy), ctypes.POINTER(ctypes.c_byte))
         
-    Returns:
-        Encrypted bytes.
-        
-    Raises:
-        OSError: If encryption fails.
-    """
-    data_in = _make_blob(plaintext)
     data_out = DATA_BLOB()
     
-    entropy_blob = None
-    p_entropy = None
-    if entropy:
-        entropy_blob = _make_blob(entropy)
-        p_entropy = ctypes.byref(entropy_blob)
-    
-    success = _CryptProtectData(
+    success = crypt32.CryptProtectData(
         ctypes.byref(data_in),
-        "VideoCutter",      # description
-        p_entropy,          # entropy
-        None,               # reserved
-        None,               # prompt
+        None,  # description
+        ctypes.byref(entropy_in) if entropy_in else None,
+        None,  # reserved
+        None,  # prompt struct
         CRYPTPROTECT_UI_FORBIDDEN,
-        ctypes.byref(data_out),
+        ctypes.byref(data_out)
     )
     
     if not success:
-        error_code = ctypes.get_last_error()
-        raise OSError(f"CryptProtectData failed (error {error_code})")
-    
+        raise OSError(f"CryptProtectData failed with error: {kernel32.GetLastError()}")
+        
     try:
-        result = ctypes.string_at(data_out.pbData, data_out.cbData)
-        return bytes(result)
+        return ctypes.string_at(data_out.pbData, data_out.cbData)
     finally:
-        if data_out.pbData:
-            _LocalFree(data_out.pbData)
+        kernel32.LocalFree(data_out.pbData)
 
-
-def dpapi_decrypt(ciphertext: bytes, entropy: bytes = b"") -> bytes:
-    """
-    Decrypt data using Windows DPAPI (CryptUnprotectData).
+def unprotect_data(data: bytes, entropy: bytes = None) -> bytes:
+    """Decrypts bytes data using Windows DPAPI CryptUnprotectData."""
+    if not isinstance(data, bytes):
+        raise TypeError("Data must be bytes")
+        
+    data_in = DATA_BLOB()
+    data_in.cbData = len(data)
+    data_in.pbData = ctypes.cast(ctypes.create_string_buffer(data), ctypes.POINTER(ctypes.c_byte))
     
-    Args:
-        ciphertext: Data to decrypt.
-        entropy: Must match the entropy used during encryption.
+    entropy_in = None
+    if entropy:
+        entropy_in = DATA_BLOB()
+        entropy_in.cbData = len(entropy)
+        entropy_in.pbData = ctypes.cast(ctypes.create_string_buffer(entropy), ctypes.POINTER(ctypes.c_byte))
         
-    Returns:
-        Decrypted bytes.
-        
-    Raises:
-        OSError: If decryption fails (wrong user, corrupt data, wrong entropy).
-    """
-    data_in = _make_blob(ciphertext)
     data_out = DATA_BLOB()
     
-    entropy_blob = None
-    p_entropy = None
-    if entropy:
-        entropy_blob = _make_blob(entropy)
-        p_entropy = ctypes.byref(entropy_blob)
-    
-    descr = ctypes.c_wchar_p()
-    
-    success = _CryptUnprotectData(
+    success = crypt32.CryptUnprotectData(
         ctypes.byref(data_in),
-        ctypes.byref(descr),
-        p_entropy,
-        None,               # reserved
-        None,               # prompt
+        None,  # description
+        ctypes.byref(entropy_in) if entropy_in else None,
+        None,  # reserved
+        None,  # prompt struct
         CRYPTPROTECT_UI_FORBIDDEN,
-        ctypes.byref(data_out),
+        ctypes.byref(data_out)
     )
     
     if not success:
-        error_code = ctypes.get_last_error()
-        raise OSError(f"CryptUnprotectData failed (error {error_code})")
-    
+        raise OSError(f"CryptUnprotectData failed with error: {kernel32.GetLastError()}")
+        
     try:
-        result = ctypes.string_at(data_out.pbData, data_out.cbData)
-        return bytes(result)
+        return ctypes.string_at(data_out.pbData, data_out.cbData)
     finally:
-        if data_out.pbData:
-            _LocalFree(data_out.pbData)
+        kernel32.LocalFree(data_out.pbData)
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  HIGH-LEVEL STORAGE FUNCTIONS
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def _get_appdata_dir() -> str:
-    """Get the canonical AppData directory, creating if needed."""
-    from version import APPDATA_FOLDER
-    app_data = os.environ.get("APPDATA", os.path.expanduser("~"))
-    folder = os.path.join(app_data, APPDATA_FOLDER)
-    os.makedirs(folder, exist_ok=True)
-    return folder
-
-
-def save_encrypted_file(filepath: str, data: dict, entropy: bytes) -> None:
-    """
-    Save a dict as DPAPI-encrypted file, atomically.
-    
-    1. Serialize to JSON.
-    2. Encrypt with DPAPI + entropy.
-    3. Write to .tmp file.
-    4. Flush + fsync.
-    5. os.replace to final path.
-    """
-    json_bytes = json.dumps(data, ensure_ascii=False).encode("utf-8")
-    encrypted = dpapi_encrypt(json_bytes, entropy)
-    
-    tmp_path = filepath + ".tmp"
-    dir_path = os.path.dirname(filepath)
-    if dir_path:
-        os.makedirs(dir_path, exist_ok=True)
-    
-    with open(tmp_path, "wb") as f:
-        f.write(encrypted)
-        f.flush()
-        os.fsync(f.fileno())
-    
-    os.replace(tmp_path, filepath)
-
-
-def load_encrypted_file(filepath: str, entropy: bytes) -> Optional[dict]:
-    """
-    Load and decrypt a DPAPI-encrypted file.
-    
-    Returns:
-        Parsed dict, or None if file doesn't exist or is corrupt.
-    """
-    if not os.path.exists(filepath):
-        return None
-    
+def save_secure_file(path: str, data: bytes) -> None:
+    """Saves bytes atomically by writing to a temporary file and replacing the target."""
+    path = os.path.normpath(path)
+    dir_name = os.path.dirname(path)
+    if dir_name:
+        os.makedirs(dir_name, exist_ok=True)
+        
+    temp_path = path + ".tmp"
     try:
-        with open(filepath, "rb") as f:
-            encrypted = f.read()
-        
-        if not encrypted:
-            return None
-        
-        decrypted = dpapi_decrypt(encrypted, entropy)
-        return json.loads(decrypted.decode("utf-8"))
+        with open(temp_path, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp_path, path)
     except Exception as e:
-        logger.warning(f"[DPAPI] failed to load {os.path.basename(filepath)}: {type(e).__name__}")
+        if os.path.exists(temp_path):
+            try:
+                os.unlink(temp_path)
+            except Exception:
+                pass
+        raise e
+
+def load_secure_file(path: str) -> Optional[bytes]:
+    """Loads and returns file content if the file exists, otherwise returns None."""
+    path = os.path.normpath(path)
+    if not os.path.exists(path):
         return None
+    with open(path, "rb") as f:
+        return f.read()
 
+def save_secure_json(path: str, data: dict, entropy_str: str = None) -> None:
+    """Serializes a dictionary, encrypts it via DPAPI, and saves it atomically."""
+    raw_str = json.dumps(data, indent=4, ensure_ascii=False)
+    raw_bytes = raw_str.encode("utf-8")
+    entropy_bytes = entropy_str.encode("utf-8") if entropy_str else None
+    encrypted_bytes = protect_data(raw_bytes, entropy_bytes)
+    save_secure_file(path, encrypted_bytes)
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  LICENSE STORAGE
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def get_license_file_path() -> str:
-    """Get path to the DPAPI-protected license file."""
-    return os.path.join(_get_appdata_dir(), "license.dat")
-
-
-def save_license_data(license_bundle: dict) -> None:
-    """
-    Save license data protected by DPAPI.
-    
-    Expected bundle keys:
-        schema_version, license_key, hwid, hwid_version,
-        last_verified_at, cached_expires_at, last_server_status
-    """
-    path = get_license_file_path()
-    save_encrypted_file(path, license_bundle, LICENSE_ENTROPY)
-    logger.info("[DPAPI] license data saved")
-
-
-def load_license_data() -> Optional[dict]:
-    """
-    Load license data from DPAPI-protected file.
-    
-    Returns:
-        License bundle dict, or None if unavailable.
-    """
-    path = get_license_file_path()
-    data = load_encrypted_file(path, LICENSE_ENTROPY)
-    if data and data.get("schema_version") == 2:
-        return data
-    if data:
-        logger.warning("[DPAPI] license data has unexpected schema version")
-    return None
+def load_secure_json(path: str, entropy_str: str = None) -> Optional[dict]:
+    """Loads, decrypts via DPAPI, and deserializes a JSON file. Returns None if invalid or missing."""
+    encrypted_bytes = load_secure_file(path)
+    if not encrypted_bytes:
+        return None
+    try:
+        entropy_bytes = entropy_str.encode("utf-8") if entropy_str else None
+        decrypted_bytes = unprotect_data(encrypted_bytes, entropy_bytes)
+        raw_str = decrypted_bytes.decode("utf-8")
+        return json.loads(raw_str)
+    except Exception:
+        return None

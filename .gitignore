@@ -12,8 +12,12 @@ output/
 *.webm
 
 dist/
+dist_sdk/
 build/
+obf_source/
+installer_output/
 *.spec
+*.log
 
 .vscode/
-.DS_Store
+.DS_Store

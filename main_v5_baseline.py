@@ -32,7 +32,6 @@ from ui.theme import APP_STYLESHEET, build_stylesheet, _DARK_TOKENS, _LIGHT_TOKE
 
 CUT_FIXED = "fixed"
 CUT_BY_SCENE = "scene"
-CUT_TO_IMAGES = "images"
 SMOOTH_TRIM_TAIL = "trim_tail"
 SMOOTH_TRIM_HEAD = "trim_head"
 OUTPUT_MODE_SPLIT_FOLDER  = 0
@@ -41,10 +40,6 @@ OUTPUT_MODE_MERGE_RENAME  = 2
 MIN_BOUNDARY_GAP = 0.05
 SHORT_FRAGMENT_THRESHOLD = 1.0
 MAX_SHORT_FRAGMENT_EXTENSION = 2.0
-SMART_SNAPSHOT_MIN_SETTLE = 0.2
-SMART_SNAPSHOT_MAX_SETTLE = 0.7
-SMART_SNAPSHOT_SAFETY_GAP = 0.15
-SMART_SNAPSHOT_STABLE_SAMPLES = 2
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".flv", ".wmv", ".m4v"}
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -92,7 +87,6 @@ LANG_DATA = {
         "cut_type_label": "Kiểu cắt:",
         "cut_fixed": "Cố định",
         "cut_by_scene": "Chuyển cảnh",
-        "cut_to_images": "Ảnh theo cảnh",
         "duration_label": "Thời lượng (s):",
         "scene_params_label": "Thông số:",
         "min_label": "Min (s):",
@@ -134,7 +128,6 @@ LANG_DATA = {
         "msg_duration_number": "Thời lượng mỗi cảnh phải là số.",
         "msg_duration_positive": "Thời lượng mỗi cảnh phải lớn hơn 0.",
         "msg_scene_params_number": "Min, Max và Scene threshold phải là số.",
-        "msg_image_threshold_number": "Scene threshold phải là số.",
         "msg_min_positive": "Min (s) phải lớn hơn 0.",
         "msg_max_gt_min": "Max (s) phải lớn hơn Min (s).",
         "msg_threshold_range": "Scene threshold phải lớn hơn 0 và nhỏ hơn 1.",
@@ -160,11 +153,6 @@ LANG_DATA = {
         "log_segment_duration": "Thời lượng mỗi cảnh: {seconds} giây",
         "log_fixed_copy": "Chế độ cố định dùng -c copy để xử lý nhanh.",
         "log_scene_encode": "Chế độ chuyển cảnh encode lại để ép keyframe và cắt chính xác hơn.",
-        "log_image_mode": "Chế độ ảnh thông minh: chọn frame ổn định sau chuyển cảnh.",
-        "log_scanning_scene_scores": "Đang quét chuyển cảnh và độ ổn định khung hình...",
-        "log_snapshot_count": "Số ảnh dự kiến xuất: {count}",
-        "log_export_image": "Xuất ảnh {number:03d} tại {time:.3f}s -> {folder}/{file}",
-        "log_missing_image_threshold": "Thiếu scene threshold để xuất ảnh.",
         "log_min_seconds": "Min seconds: {val}",
         "log_max_seconds": "Max seconds: {val}",
         "log_threshold": "Scene threshold: {val}",
@@ -244,7 +232,6 @@ LANG_DATA = {
         "cut_type_label": "Cut Type:",
         "cut_fixed": "Fixed Duration",
         "cut_by_scene": "Scene Detection",
-        "cut_to_images": "Scene Snapshots",
         "duration_label": "Duration (s):",
         "scene_params_label": "Parameters:",
         "min_label": "Min (s):",
@@ -286,7 +273,6 @@ LANG_DATA = {
         "msg_duration_number": "Scene duration must be a number.",
         "msg_duration_positive": "Scene duration must be greater than 0.",
         "msg_scene_params_number": "Min, Max and Scene threshold must be numbers.",
-        "msg_image_threshold_number": "Scene threshold must be a number.",
         "msg_min_positive": "Min (s) must be greater than 0.",
         "msg_max_gt_min": "Max (s) must be greater than Min (s).",
         "msg_threshold_range": "Scene threshold must be between 0 and 1.",
@@ -312,11 +298,6 @@ LANG_DATA = {
         "log_segment_duration": "Segment duration: {seconds} seconds",
         "log_fixed_copy": "Fixed mode uses -c copy for fast processing.",
         "log_scene_encode": "Scene mode re-encodes to force keyframes for precise cuts.",
-        "log_image_mode": "Smart image mode: selects a stable frame after each scene change.",
-        "log_scanning_scene_scores": "Scanning scene changes and frame stability...",
-        "log_snapshot_count": "Expected snapshots: {count}",
-        "log_export_image": "Export image {number:03d} at {time:.3f}s -> {folder}/{file}",
-        "log_missing_image_threshold": "Missing scene threshold for image export.",
         "log_min_seconds": "Min seconds: {val}",
         "log_max_seconds": "Max seconds: {val}",
         "log_threshold": "Scene threshold: {val}",
@@ -400,13 +381,6 @@ def resource_path(relative_path: str) -> Path:
 
 
 def find_ffmpeg_tools():
-    if getattr(sys, "frozen", False):
-        exe_dir = Path(sys.executable).parent
-        bundled_ffmpeg = exe_dir / "ffmpeg.exe"
-        bundled_ffprobe = exe_dir / "ffprobe.exe"
-        if bundled_ffmpeg.exists() and bundled_ffprobe.exists():
-            return str(bundled_ffmpeg), str(bundled_ffprobe)
-            
     ffmpeg_path = shutil.which("ffmpeg")
     ffprobe_path = shutil.which("ffprobe")
 
@@ -549,16 +523,15 @@ def run_ffmpeg_segment(
         )
 
 
-def get_video_properties(video_path: Path, ffprobe_path: str) -> dict:
-    """Lấy duration, width, height, fps, pix_fmt, color_transfer trong MỘT lần gọi ffprobe."""
-    import json as _json
+def get_video_duration(video_path: Path, ffprobe_path: str) -> float:
     command = [
         ffprobe_path,
-        "-v", "error",
-        "-select_streams", "v:0",
+        "-v",
+        "error",
         "-show_entries",
-        "stream=width,height,r_frame_rate,pix_fmt,color_transfer:format=duration",
-        "-of", "json",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
         str(video_path),
     ]
 
@@ -572,33 +545,7 @@ def get_video_properties(video_path: Path, ffprobe_path: str) -> dict:
         creationflags=get_subprocess_creationflags(),
     )
 
-    data = _json.loads(result.stdout)
-    stream = data.get("streams", [{}])[0]
-    fmt = data.get("format", {})
-
-    # Parse FPS từ r_frame_rate dạng "30000/1001"
-    fps = 0.0
-    r_fps = stream.get("r_frame_rate", "0/1")
-    try:
-        num, den = r_fps.split("/")
-        fps = float(num) / float(den) if float(den) != 0 else 0.0
-    except (ValueError, ZeroDivisionError):
-        fps = 0.0
-
-    return {
-        "duration": float(fmt.get("duration", 0)),
-        "width": int(stream.get("width", 0)),
-        "height": int(stream.get("height", 0)),
-        "fps": round(fps, 3),
-        "pix_fmt": stream.get("pix_fmt", ""),
-        "color_transfer": stream.get("color_transfer", ""),
-    }
-
-
-def get_video_duration(video_path: Path, ffprobe_path: str) -> float:
-    """Wrapper tương thích ngược — dùng get_video_properties bên trong."""
-    props = get_video_properties(video_path, ffprobe_path)
-    return props["duration"]
+    return float(result.stdout.strip())
 
 
 def normalize_split_times(split_times: list[float], duration: float) -> list[float]:
@@ -622,16 +569,23 @@ def detect_scene_changes(
     if cancel_event is not None and cancel_event.is_set():
         raise ProcessingCancelled("Processing cancelled.")
 
-    # Quét cảnh bằng CPU thuần — triệt tiêu độ trễ VRAM-to-RAM
-    command = [
-        ffmpeg_path,
-        "-threads", "auto",
+    command = [ffmpeg_path]
+    
+    # Rẽ nhánh tăng tốc phần cứng khi giải mã quét khung hình
+    if hardware_type == "nvidia":
+        command += ["-hwaccel", "cuda"]
+    elif hardware_type == "amd":
+        command += ["-hwaccel", "d3d11va"]
+
+    command += [
         "-hide_banner",
-        "-i", str(video_path),
+        "-i",
+        str(video_path),
         "-filter:v",
         f"fps=10,scale=256:-1,select='gt(scene,{threshold})',showinfo",
-        "-an", "-sn", "-dn",
-        "-f", "null",
+        "-an",
+        "-f",
+        "null",
         "-",
     ]
 
@@ -671,140 +625,6 @@ def detect_scene_changes(
         scene_times.append(float(match.group(1)))
 
     return sorted(set(scene_times))
-
-
-def detect_scene_scores(
-    video_path: Path,
-    ffmpeg_path: str,
-    cancel_event: threading.Event | None = None,
-    process_callback=None,
-) -> list[tuple[float, float]]:
-    """Return low-resolution scene scores for every 10 fps sample in one scan."""
-    if cancel_event is not None and cancel_event.is_set():
-        raise ProcessingCancelled("Processing cancelled.")
-
-    command = [
-        ffmpeg_path,
-        "-threads", "auto",
-        "-hide_banner",
-        "-i", str(video_path),
-        "-filter:v",
-        "fps=10,scale=256:-1,select='gte(scene,0)',metadata=print:key=lavfi.scene_score",
-        "-an", "-sn", "-dn",
-        "-f", "null",
-        "-",
-    ]
-
-    process = subprocess.Popen(
-        command,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        creationflags=get_subprocess_creationflags(),
-    )
-
-    if process_callback is not None:
-        process_callback(process)
-
-    try:
-        _, stderr = process.communicate()
-    finally:
-        if process_callback is not None:
-            process_callback(None)
-
-    if cancel_event is not None and cancel_event.is_set():
-        if process.poll() is None:
-            process.terminate()
-        raise ProcessingCancelled("Processing cancelled.")
-
-    if process.returncode != 0:
-        raise subprocess.CalledProcessError(
-            process.returncode,
-            command,
-            stderr=stderr,
-        )
-
-    scene_scores = []
-    pending_time = None
-    for line in stderr.splitlines():
-        time_match = re.search(r"pts_time:([0-9]+(?:\.[0-9]+)?)", line)
-        if time_match:
-            pending_time = float(time_match.group(1))
-
-        score_match = re.search(r"lavfi\.scene_score=([0-9]+(?:\.[0-9]+)?)", line)
-        if score_match and pending_time is not None:
-            scene_scores.append((pending_time, float(score_match.group(1))))
-            pending_time = None
-
-    return scene_scores
-
-
-def build_smart_snapshot_times(
-    scene_scores: list[tuple[float, float]],
-    duration: float,
-    threshold: float,
-) -> list[float]:
-    """Choose one stable snapshot per scene without crossing into the next scene."""
-    if duration <= 0:
-        return []
-
-    scene_starts = [0.0]
-    scene_starts.extend(
-        time
-        for time, score in scene_scores
-        if score > threshold and 0 < time < duration
-    )
-    scene_starts = sorted({round(time, 3) for time in scene_starts})
-    stable_score_limit = min(0.08, threshold * 0.5)
-    snapshot_times = []
-
-    for index, scene_start in enumerate(scene_starts):
-        next_scene = (
-            scene_starts[index + 1]
-            if index + 1 < len(scene_starts)
-            else duration
-        )
-        latest_safe_time = min(
-            scene_start + SMART_SNAPSHOT_MAX_SETTLE,
-            next_scene - SMART_SNAPSHOT_SAFETY_GAP,
-            duration - SMART_SNAPSHOT_SAFETY_GAP,
-        )
-        earliest_settle_time = min(
-            scene_start + SMART_SNAPSHOT_MIN_SETTLE,
-            latest_safe_time,
-        )
-        stable_samples = 0
-        selected_time = None
-
-        for sample_time, score in scene_scores:
-            if sample_time < earliest_settle_time:
-                continue
-            if sample_time > latest_safe_time:
-                break
-
-            if score <= stable_score_limit:
-                stable_samples += 1
-                if stable_samples >= SMART_SNAPSHOT_STABLE_SAMPLES:
-                    selected_time = sample_time
-                    break
-            else:
-                stable_samples = 0
-
-        if selected_time is None:
-            selected_time = latest_safe_time
-
-        snapshot_times.append(round(max(scene_start, selected_time), 3))
-
-    return snapshot_times
-
-
-def format_snapshot_time(snapshot_time: float) -> str:
-    hours = int(snapshot_time // 3600)
-    minutes = int((snapshot_time % 3600) // 60)
-    seconds = snapshot_time % 60
-    return f"{hours:02d}-{minutes:02d}-{seconds:06.3f}"
 
 
 def build_duration_split_times(duration: float, segment_seconds: float) -> list[float]:
@@ -1642,7 +1462,6 @@ class VideoCutterApp(QMainWindow):
         self.cut_type_menu.addItems([
             self.t("cut_fixed"),
             self.t("cut_by_scene"),
-            self.t("cut_to_images"),
         ])
         self.cut_type_menu.setFixedSize(180, 32)
         self.cut_type_menu.currentTextChanged.connect(self._on_cut_type_changed)
@@ -1943,14 +1762,11 @@ class VideoCutterApp(QMainWindow):
         self.cut_type_menu.addItems([
             self.t("cut_fixed"),
             self.t("cut_by_scene"),
-            self.t("cut_to_images"),
         ])
-        cut_text = {
-            CUT_FIXED: self.t("cut_fixed"),
-            CUT_BY_SCENE: self.t("cut_by_scene"),
-            CUT_TO_IMAGES: self.t("cut_to_images"),
-        }.get(current_cut, self.t("cut_fixed"))
-        self.cut_type_menu.setCurrentText(cut_text)
+        self.cut_type_menu.setCurrentText(
+            self.t("cut_fixed") if current_cut == CUT_FIXED
+            else self.t("cut_by_scene")
+        )
         self.cut_type_menu.blockSignals(False)
 
         self.duration_label_widget.setText(self.t("duration_label"))
@@ -1981,10 +1797,8 @@ class VideoCutterApp(QMainWindow):
     def _on_cut_type_changed(self, choice):
         if choice == self.t("cut_fixed"):
             self.cut_type = CUT_FIXED
-        elif choice == self.t("cut_by_scene"):
-            self.cut_type = CUT_BY_SCENE
         else:
-            self.cut_type = CUT_TO_IMAGES
+            self.cut_type = CUT_BY_SCENE
         self.update_cut_mode_ui()
 
     def _on_output_mode_changed(self, index):
@@ -2004,25 +1818,16 @@ class VideoCutterApp(QMainWindow):
 
     def update_cut_mode_ui(self, _=None):
         is_fixed = (self.cut_type == CUT_FIXED)
-        is_scene = (self.cut_type == CUT_BY_SCENE)
-        is_image_mode = (self.cut_type == CUT_TO_IMAGES)
-        is_scene_based = is_scene or is_image_mode
 
         # Fixed Mode widgets
         self.duration_label_widget.setVisible(is_fixed)
         self.seconds_entry.setVisible(is_fixed)
 
-        # Scene mode has Min/Max/Threshold and smoothing; image mode needs Threshold only.
-        self.scene_params_label_widget.setVisible(is_scene_based)
-        self.scene_params_container.setVisible(is_scene_based)
-        self.min_label_widget.setVisible(is_scene)
-        self.min_seconds_entry.setVisible(is_scene)
-        self.max_label_widget.setVisible(is_scene)
-        self.max_seconds_entry.setVisible(is_scene)
-        self.threshold_label_widget.setVisible(is_scene_based)
-        self.scene_threshold_entry.setVisible(is_scene_based)
-        self.smooth_label_widget.setVisible(is_scene)
-        self.smooth_container.setVisible(is_scene)
+        # Scene Mode widgets/containers
+        self.scene_params_label_widget.setVisible(not is_fixed)
+        self.scene_params_container.setVisible(not is_fixed)
+        self.smooth_label_widget.setVisible(not is_fixed)
+        self.smooth_container.setVisible(not is_fixed)
 
         self.update_smooth_ui()
 
@@ -2126,16 +1931,11 @@ class VideoCutterApp(QMainWindow):
 
         for file_info in files:
             try:
-                props = get_video_properties(
+                duration = get_video_duration(
                     Path(file_info["path"]),
                     ffprobe_path,
                 )
-                file_info["duration"] = props["duration"]
-                file_info["width"] = props["width"]
-                file_info["height"] = props["height"]
-                file_info["fps"] = props["fps"]
-                file_info["pix_fmt"] = props["pix_fmt"]
-                file_info["color_transfer"] = props["color_transfer"]
+                file_info["duration"] = duration
             except Exception:
                 file_info["duration"] = -1.0
 
@@ -2354,7 +2154,6 @@ class VideoCutterApp(QMainWindow):
                     msg_box = QMessageBox(self)
                     msg_box.setWindowTitle(self.t("msg_complete_title"))
                     msg_box.setIcon(QMessageBox.Icon.NoIcon)
-                    msg_box.setWindowIcon(self.windowIcon())
 
                     num_videos = len(self.file_list)
                     output_path = str(self.last_output_dir) if self.last_output_dir else ""
@@ -2475,15 +2274,6 @@ class VideoCutterApp(QMainWindow):
                 if smooth_seconds < 0:
                     raise ValueError(self.t("msg_smooth_positive"))
 
-        elif cut_type == CUT_TO_IMAGES:
-            try:
-                scene_threshold = float(self.scene_threshold_entry.text().strip())
-            except ValueError:
-                raise ValueError(self.t("msg_image_threshold_number"))
-
-            if not 0 < scene_threshold < 1:
-                raise ValueError(self.t("msg_threshold_range"))
-
         else:
             raise ValueError(self.t("msg_cut_type_invalid"))
 
@@ -2552,9 +2342,8 @@ class VideoCutterApp(QMainWindow):
         self.log_box.clear()
         self.log_box.setReadOnly(True)
 
-        # Copy file list for thread safety (deep copy dicts to avoid race condition)
-        import copy
-        file_list_copy = [copy.copy(fi) for fi in self.file_list]
+        # Copy file list for thread safety
+        file_list_copy = list(self.file_list)
 
         self.worker_thread = threading.Thread(
             target=self.process_all_videos,
@@ -2648,7 +2437,6 @@ class VideoCutterApp(QMainWindow):
             for idx, file_info in enumerate(file_list_copy):
                 self.check_cancelled()
                 video_path = Path(file_info["path"])
-                # Truyền file_info vào process_single_video để tận dụng cache metadata
 
                 if not video_path.exists():
                     self.log(
@@ -2702,7 +2490,6 @@ class VideoCutterApp(QMainWindow):
                         export_mode=output_mode,
                         video_idx=video_idx,
                         global_folder_counters=None,
-                        file_info=file_info,
                     )
                     total_exported += exported
                     self.last_output_dir = video_parent_dir
@@ -2734,7 +2521,6 @@ class VideoCutterApp(QMainWindow):
                         export_mode=output_mode,
                         video_idx=video_idx,
                         global_folder_counters=global_folder_counters,
-                        file_info=file_info,
                     )
                     total_exported += exported
 
@@ -2795,104 +2581,6 @@ class VideoCutterApp(QMainWindow):
     #  PROCESS SINGLE VIDEO
     # ══════════════════════════════════════════════════════════════════════════
 
-    def process_single_video_to_images(
-        self,
-        video_path: Path,
-        scene_threshold: float | None,
-        ffmpeg_path: str,
-        ffprobe_path: str,
-        output_folders: list[Path],
-        scene_counter_start: int,
-        output_folder_count: int,
-        progress_callback,
-        export_mode: int,
-        global_folder_counters: dict | None,
-        file_info: dict | None,
-    ) -> tuple[int, int]:
-        """Export one high-quality JPEG from the stable part of every detected scene."""
-        if scene_threshold is None:
-            raise RuntimeError(self.t("log_missing_image_threshold"))
-
-        self.check_cancelled()
-        self.log(self.t("log_input").format(path=video_path))
-        self.log(self.t("log_cut_type").format(type=CUT_TO_IMAGES))
-        self.log(self.t("log_image_mode"))
-        self.log(self.t("log_threshold").format(val=scene_threshold))
-
-        cached_info = file_info or {}
-        duration = (
-            cached_info.get("duration", -1.0)
-            if cached_info.get("duration", -1.0) > 0
-            else get_video_duration(video_path, ffprobe_path)
-        )
-        if duration <= 0:
-            raise RuntimeError(self.t("log_invalid_duration"))
-
-        self.log(self.t("log_duration").format(duration=duration))
-        self.log(self.t("log_scanning_scene_scores"))
-        progress_callback(0.02)
-        scene_scores = detect_scene_scores(
-            video_path,
-            ffmpeg_path,
-            self.cancel_event,
-            self.set_current_process,
-        )
-        self.check_cancelled()
-        progress_callback(0.20)
-
-        scene_count = sum(1 for _, score in scene_scores if score > scene_threshold)
-        snapshot_times = build_smart_snapshot_times(
-            scene_scores,
-            duration,
-            scene_threshold,
-        )
-        self.log(self.t("log_scene_count").format(count=scene_count))
-        self.log(self.t("log_snapshot_count").format(count=len(snapshot_times)))
-
-        exported_count = 0
-        scene_counter = scene_counter_start
-        for snapshot_index, snapshot_time in enumerate(snapshot_times, start=1):
-            self.check_cancelled()
-            scene_counter += 1
-            folder_target_idx = ((snapshot_index - 1) % output_folder_count) + 1
-            target_dir = output_folders[folder_target_idx - 1]
-
-            if export_mode == OUTPUT_MODE_MERGE_RENAME and global_folder_counters is not None:
-                global_folder_counters[folder_target_idx] += 1
-                sequence_number = global_folder_counters[folder_target_idx]
-            else:
-                sequence_number = snapshot_index
-
-            output_file = target_dir / f"{sequence_number:03d}_{safe_filename(video_path.stem)}.jpg"
-            command = self.build_snapshot_command(
-                ffmpeg_path,
-                video_path,
-                snapshot_time,
-                output_file,
-            )
-            run_ffmpeg_segment(
-                command,
-                duration,
-                lambda _value: None,
-                self.cancel_event,
-                self.set_current_process,
-            )
-
-            if not output_file.exists():
-                raise RuntimeError(f"FFmpeg did not create snapshot: {output_file.name}")
-
-            self.log(
-                self.t("log_export_image").format(
-                    number=scene_counter,
-                    time=snapshot_time,
-                    folder=target_dir.name,
-                    file=output_file.name,
-                )
-            )
-            exported_count += 1
-            progress_callback(0.20 + (snapshot_index / len(snapshot_times)) * 0.80)
-
-        return scene_counter, exported_count
     def process_single_video(
         self,
         video_path: Path,
@@ -2914,28 +2602,12 @@ class VideoCutterApp(QMainWindow):
         export_mode: int = OUTPUT_MODE_MERGE_DEFAULT,
         video_idx: int = 1,
         global_folder_counters: dict | None = None,
-        file_info: dict | None = None,
     ) -> tuple[int, int]:
         """
         Process a single video: detect cuts, run FFmpeg, distribute segments.
         Returns (final_scene_counter, exported_count).
         """
         video_name_clean = safe_filename(video_path.stem)
-        
-        if cut_type == CUT_TO_IMAGES:
-            return self.process_single_video_to_images(
-                video_path=video_path,
-                scene_threshold=scene_threshold,
-                ffmpeg_path=ffmpeg_path,
-                ffprobe_path=ffprobe_path,
-                output_folders=output_folders,
-                scene_counter_start=scene_counter_start,
-                output_folder_count=output_folder_count,
-                progress_callback=progress_callback,
-                export_mode=export_mode,
-                global_folder_counters=global_folder_counters,
-                file_info=file_info,
-            )
         
         # Sinh chuỗi ID ngắn ngẫu nhiên để đảm bảo thư mục tạm an toàn tuyệt đối cho FFmpeg
         safe_temp_id = uuid.uuid4().hex[:8]
@@ -2949,13 +2621,7 @@ class VideoCutterApp(QMainWindow):
             self.log(self.t("log_cut_type").format(type=cut_type))
             self.log(self.t("log_remove_audio").format(status=on_off(remove_audio)))
 
-            # ── Lấy metadata từ cache (file_info) thay vì gọi ffprobe lần 2 ──
-            duration = file_info.get("duration", -1.0) if file_info.get("duration", -1.0) > 0 else get_video_duration(video_path, ffprobe_path)
-            v_width = file_info.get("width", 0)
-            v_height = file_info.get("height", 0)
-            v_fps = file_info.get("fps", 0.0)
-            v_pix_fmt = file_info.get("pix_fmt", "")
-            v_color_transfer = file_info.get("color_transfer", "")
+            duration = get_video_duration(video_path, ffprobe_path)
             self.check_cancelled()
             self.log(self.t("log_duration").format(duration=duration))
 
@@ -2994,19 +2660,6 @@ class VideoCutterApp(QMainWindow):
                     or scene_threshold is None
                 ):
                     raise RuntimeError(self.t("log_missing_scene_params"))
-
-                # ── CHẶN LỖI MÀU HDR / 10-BIT (Chỉ Scene Mode) ──
-                is_hdr_10bit = (
-                    ("10" in v_pix_fmt) or
-                    v_color_transfer.lower() in ("smpte2084", "arib-std-b67")
-                )
-                if is_hdr_10bit:
-                    self.log(
-                        f'<span style="color: #e6a817;">[BỎ QUA] Video HDR/10-bit chưa được hỗ trợ '
-                        f'(pix_fmt={v_pix_fmt}, color_transfer={v_color_transfer}), '
-                        f'bỏ qua để tránh lỗi màu.</span>'
-                    )
-                    return scene_counter_start, 0
 
                 self.log(self.t("log_scene_encode"))
                 self.log(self.t("log_min_seconds").format(val=min_seconds))
@@ -3099,9 +2752,6 @@ class VideoCutterApp(QMainWindow):
                     duration,
                     remove_audio,
                     hardware_type=self.hardware_type,
-                    v_width=v_width,
-                    v_height=v_height,
-                    v_fps=v_fps,
                 )
 
             else:
@@ -3194,8 +2844,6 @@ class VideoCutterApp(QMainWindow):
                     else:
                         seq_num = segment_idx
                     stt_str = str(seq_num).zfill(3)
-                    
-                    
                     output_file = target_dir / f"{stt_str}_{video_name_clean}.mp4"
                 else:
                     # Mode 1 (Merge Default): original segment index of this video
@@ -3293,53 +2941,6 @@ class VideoCutterApp(QMainWindow):
 
         return command
 
-    @staticmethod
-    def build_snapshot_command(
-        ffmpeg_path: str,
-        video_path: Path,
-        snapshot_time: float,
-        output_file: Path,
-    ) -> list[str]:
-        return [
-            ffmpeg_path,
-            "-threads", "auto",
-            "-y",
-            "-ss", f"{snapshot_time:.3f}",
-            "-i", str(video_path),
-            "-map", "0:v:0",
-            "-frames:v", "1",
-            "-q:v", "2",
-            "-progress", "pipe:1",
-            "-nostats",
-            str(output_file),
-        ]
-
-    @staticmethod
-    def _get_bitrate_params(width: int, height: int, fps: float, hardware_type: str) -> dict:
-        """Ma trận bitrate động chuẩn YouTube dựa trên độ phân giải và FPS."""
-        # Xác định tier dựa trên chiều rộng thực tế (landscape) hoặc chiều cao (portrait)
-        res = max(width, height)
-        high_fps = fps > 30
-
-        if res >= 3840:  # 4K
-            if high_fps:
-                cq, bv, maxr = 21, "50M", "68M"
-            else:
-                cq, bv, maxr = 21, "35M", "50M"
-            bufsize = "75M"
-        elif res >= 2560:  # 1440p / 2K
-            cq, bv, maxr, bufsize = 21, "20M", "30M", "45M"
-        elif res >= 1920:  # 1080p
-            if high_fps:
-                cq, bv, maxr = 22, "15M", "22M"
-            else:
-                cq, bv, maxr = 22, "10M", "16M"
-            bufsize = "30M"
-        else:  # Dưới 1080p
-            cq, bv, maxr, bufsize = 23, "6M", "10M", "15M"
-
-        return {"cq": str(cq), "bv": bv, "maxrate": maxr, "bufsize": bufsize}
-
     def build_scene_segment_command(
         self,
         ffmpeg_path: str,
@@ -3349,22 +2950,16 @@ class VideoCutterApp(QMainWindow):
         max_seconds: float,
         duration: float,
         remove_audio: bool,
-        hardware_type: str = "cpu",
-        v_width: int = 0,
-        v_height: int = 0,
-        v_fps: float = 0.0,
+        hardware_type: str = "cpu"
     ) -> list[str]:
         # Khởi tạo khung xương lệnh gốc
         command = [
             ffmpeg_path,
-            "-threads", "auto",
+            "-threads", "8",
             "-y",
             "-progress", "pipe:1",
             "-nostats",
         ]
-
-        # ── Tính toán bitrate động từ ma trận YouTube ──
-        bp = self._get_bitrate_params(v_width, v_height, v_fps, hardware_type)
 
         # --- RẼ NHÁNH TẬP LỆNH MÃ HÓA THEO THIẾT BỊ PHẦN CỨNG ---
         if hardware_type == "nvidia":
@@ -3372,23 +2967,21 @@ class VideoCutterApp(QMainWindow):
             command += [
                 "-hwaccel", "cuda",
                 "-hwaccel_output_format", "cuda",
-                "-threads", "auto",
                 "-i", str(video_path),
                 "-map", "0:v:0",
             ]
             if remove_audio: command += ["-an"]
             else: command += ["-map", "0:a?"]
-            command += ["-sn", "-dn"]
 
             command += [
                 "-c:v", "h264_nvenc",
-                "-preset", "p2",             # Preset p2 ưu tiên tốc độ mã hóa tối đa
+                "-preset", "p4",             # Preset p4 cân bằng hoàn hảo tốc độ và độ sắc nét
                 "-tune", "hq",               # High Quality offline render
                 "-rc", "vbr",
-                "-cq", bp["cq"],             # Constant Quality động theo độ phân giải
-                "-b:v", bp["bv"],            # Bitrate mục tiêu động
-                "-maxrate", bp["maxrate"],   # Trần tối đa động
-                "-bufsize", bp["bufsize"],   # Buffer size tối ưu
+                "-cq", "22",                 # Constant Quality 22 cho chất lượng đỉnh cao
+                "-b:v", "25M",               # Bitrate mục tiêu 25M
+                "-maxrate", "50M",           # Trần tối đa 50M (Phục vụ hoàn hảo cho video 4K)
+                "-bufsize", "75M",           # Buffer size tối ưu
                 "-forced-idr", "1",
                 "-g", "60",
             ]
@@ -3396,22 +2989,20 @@ class VideoCutterApp(QMainWindow):
 
         elif hardware_type == "amd":
             # ── TRƯỜNG HỢP 2: MÁY SỬ DỤNG CARD AMD AMF ──
-            # Giải mã bằng phần mềm để đảm bảo tương thích mọi đời card AMD
             command += [
-                "-threads", "auto",
+                "-hwaccel", "d3d11va",       # Tăng tốc phần cứng Direct3D tiêu chuẩn của AMD
                 "-i", str(video_path),
                 "-map", "0:v:0",
             ]
             if remove_audio: command += ["-an"]
             else: command += ["-map", "0:a?"]
-            command += ["-sn", "-dn"]
 
             command += [
                 "-c:v", "h264_amf",
                 "-rc", "vbr_peak",           # Chế độ Peak VBR thông minh của AMD
-                "-quality", "speed",         # Ưu tiên tốc độ mã hóa tối đa
-                "-b:v", bp["bv"],            # Bitrate mục tiêu động
-                "-maxrate", bp["maxrate"],   # Trần tối đa động
+                "-quality", "quality",       # Đặt chất lượng render lên ưu tiên hàng đầu
+                "-b:v", "25M",
+                "-maxrate", "50M",           # Hỗ trợ bung băng thông cho video 4K sắc nét
                 "-forced-idr", "1",
                 "-g", "60",
             ]
@@ -3420,18 +3011,16 @@ class VideoCutterApp(QMainWindow):
         else:
             # ── TRƯỜNG HỢP 3: MÁY KHÔNG CÓ GPU HOẶC INTEL (DỰ PHÒNG AN TOÀN CPU) ──
             command += [
-                "-threads", "auto",
                 "-i", str(video_path),
                 "-map", "0:v:0",
             ]
             if remove_audio: command += ["-an"]
             else: command += ["-map", "0:a?"]
-            command += ["-sn", "-dn"]
 
             # Sử dụng thư viện libx264 phần mềm, crf 22 giữ độ nét tương đương bản gốc
             command += [
                 "-c:v", "libx264",
-                "-preset", "superfast",      # Tốc độ mã hóa CPU tối đa cho máy không GPU rời
+                "-preset", "veryfast",       # Đảm bảo tốc độ CPU không bị quá ì ạch
                 "-crf", "22",
             ]
             if not remove_audio: command += ["-c:a", "aac", "-b:a", "192k"] # Mã hóa audio an toàn bằng CPU
@@ -3462,6 +3051,7 @@ class VideoCutterApp(QMainWindow):
             "-reset_timestamps", "1",
             "-segment_start_number", "1",
             "-segment_format", "mp4",
+            "-segment_format_options", "movflags=+faststart",
             str(temp_pattern),
         ]
 
@@ -3486,9 +3076,6 @@ if __name__ == "__main__":
     os.environ["QT_ENABLE_HIGHDPI_SCALING"] = "1"
     QApplication.setHighDpiScaleFactorRoundingPolicy(Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
     app = QApplication(sys.argv)
-    app_icon_path = resource_path("icon_scissors.ico")
-    if app_icon_path.exists():
-        app.setWindowIcon(QIcon(str(app_icon_path)))
 
     # --- KIỂM TRA PENDING UPDATE MARKER ---
     from updater import verify_pending_update_marker, run_update_check

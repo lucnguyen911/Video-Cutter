@@ -1,0 +1,31 @@
+﻿HƯỚNG DẪN HWID ỔN ĐỊNH, LICENSE VÀ QUẢN LÝ THIẾT BỊ
+===================================================
+
+Mục tiêu: Một license dùng được N máy theo max_devices; HWID ổn định qua cập nhật Windows; server là nơi quyết định quyền dùng.
+
+HWID khuyến nghị
+1. Anchor chính: SMBIOS Product UUID từ Win32_ComputerSystemProduct.UUID.
+2. Loại UUID rỗng, 000..., ffff..., “to be filled”, “default string”.
+3. Fallback duy nhất: Windows MachineGuid ở HKLM\SOFTWARE\Microsoft\Cryptography.
+4. Chuẩn hóa '<namespace_app>|<source>|<anchor_chữ_thường>', sau đó SHA-256 hex 64 ký tự. Không gửi raw UUID.
+5. Cache DeviceIdentity bằng Windows DPAPI tại %APPDATA%\<App>\device_profile.dat, kèm hwid_version/source. Mất cache phải tính lại ra cùng HWID nếu anchor còn.
+6. Đổi thuật toán phải tăng hwid_version và migration một lần ở server sau khi key đã xác thực.
+
+Không dùng MAC, IP, tên máy, serial ổ đĩa, CPU ID hoặc tổ hợp giá trị biến động làm anchor chính. Đổi mainboard là máy mới và phải reset device theo quy trình hỗ trợ.
+
+License local và offline
+- Lưu key, HWID hash, trạng thái server, last_verified_at, expiry cache bằng DPAPI. Ghi atomic: .tmp -> flush/fsync -> os.replace.
+- Mỗi startup: tạo HWID -> đọc license local -> gọi RPC server -> cache kết quả online thành công.
+- Offline grace ngắn chỉ áp dụng khi đã từng verify và lỗi hiện tại là mạng/server. Không áp dụng cho key mới, expired, revoked hoặc HWID sai.
+
+Supabase
+- Không cho client SELECT/UPDATE trực tiếp bảng license. Dùng SECURITY DEFINER RPC transaction.
+- RPC phải kiểm tra key, is_active, expired_at, max_devices; FOR UPDATE dòng license; nếu HWID đã tồn tại thì thành công; nếu máy mới và còn chỗ thì thêm atomically; nếu đầy trả DEVICE_LIMIT.
+- Có thể dùng một bảng license với device_hwids JSONB để dễ quản lý. Mỗi entry: hwid_hash, hwid_version, added_at, last_seen_at.
+- RLS chỉ cấp EXECUTE RPC cần thiết. Service-role key chỉ ở server/CI, không nằm trong EXE.
+
+Cột license gợi ý: id, customer_name, license_key unique, is_active, expired_at, max_devices, device_hwids JSONB, created_at, contact_info, note.
+
+Test: mở lại cùng máy không tạo device thứ hai; máy hai bị chặn khi max_devices=1; tăng 2 thì được; copy file license sang máy khác vẫn bị chặn; offline grace đúng hạn; expired/revoked không vào app; update/reinstall Windows giữ HWID khi mainboard UUID còn nguyên.
+
+HWID/obfuscation không chống crack 100%. Bảo vệ thật là RPC transaction, RLS, max_devices, revoke/expiry, log và quy trình reset có kiểm soát.

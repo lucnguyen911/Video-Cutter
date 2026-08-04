@@ -1,0 +1,42 @@
+﻿HƯỚNG DẪN UPDATE TỰ ĐỘNG QUA GOOGLE DRIVE
+==========================================
+
+Mục tiêu: App đọc metadata từ Supabase, tải installer mới từ Google Drive, xác thực chặt chẽ rồi cài đè vào đúng thư mục bản cũ.
+
+Cột bắt buộc trong app_versions
+- app_id: mã dự án; mỗi app có đúng một dòng is_active=true.
+- latest_version, changelog, download_url.
+- sha256: SHA-256 64 ký tự hex của installer cuối cùng.
+- file_size: số byte chính xác của installer.
+- package_type: hiện chỉ dùng full.
+- enforcement: forced hoặc optional.
+- is_active và published_at.
+
+Luồng client an toàn
+1. Chỉ kiểm tra update trong EXE frozen, không kiểm tra lúc chạy source/dev.
+2. Lấy một dòng active theo app_id. Từ chối nếu thiếu URL HTTPS, SHA-256 hợp lệ, file_size > 0, package_type=full hoặc version không mới hơn client.
+3. Hỗ trợ link Drive /file/d/<FILE_ID>/view và open?id=<FILE_ID>. Tự lấy FILE_ID và xử lý confirmation page của file lớn. Không bao giờ lưu trang HTML thành EXE.
+4. Tải streaming vào thư mục temp riêng, tính SHA-256 trong lúc ghi. Sau tải phải khớp số byte, SHA-256 và hai byte đầu MZ.
+5. Trước khi chạy Inno Setup, ghi pending-update marker bằng DPAPI gồm version cũ, version đích và thư mục cài dự kiến.
+6. Chạy installer với /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /CLOSEAPPLICATIONS /DIR=<thư_mục_app_hiện_tại>.
+7. Lần mở sau chỉ xác nhận update thành công nếu version và thư mục thực tế cùng khớp marker. Nếu sai, xóa marker để tránh update loop.
+
+enforcement
+- forced: chỉ có Cập nhật ngay hoặc Thoát ứng dụng. Không hoàn tất update thì không vào app.
+- optional: có Cập nhật ngay hoặc Bỏ qua. Người dùng vẫn dùng bản cũ.
+Đây là chính sách app; nếu luôn bắt buộc thì giữ forced, không cần sửa mỗi release.
+
+Quy trình phát hành
+1. Tăng APP_VERSION và MyAppVersion cùng một giá trị.
+2. Build installer mới, không thay/revision file đã phát hành.
+3. Tính hash và dung lượng artifact cuối:
+   $installer='C:\Đường_dẫn\My_App_Setup_v1.0.2.exe'
+   (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash
+   (Get-Item -LiteralPath $installer).Length
+4. Upload file mới lên Drive; Share: Anyone with the link, Viewer, cho phép tải.
+5. Mở link ở cửa sổ ẩn danh để xác minh không cần đăng nhập; chỉ dùng link FILE, không dùng link thư mục.
+6. Test update từ bản cũ. Sau đó mới UPDATE đúng dòng app_id trong Supabase với version, link, SHA-256, file_size, changelog và published_at.
+
+Không làm: không nhúng Google password/token vào app; không tắt hash check; không dùng lại version đã phát hành; không sửa file Drive đã public.
+
+Chẩn đoán: Không popup thường do thiếu SHA-256/file_size, URL không public, is_active sai hoặc version server không cao hơn client. HTML trả về nghĩa là quyền Drive/confirmation page sai. Hash sai nghĩa là Drive không chứa đúng artifact đã hash.
