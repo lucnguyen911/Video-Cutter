@@ -4,6 +4,7 @@ Usage: .venv\\Scripts\\python.exe build_protected.py
 """
 from pathlib import Path
 import hashlib
+import os
 import shutil
 import subprocess
 import sys
@@ -19,6 +20,12 @@ MSVC_RUNTIME_PATTERNS = (
     "concrt140.dll",
     "msvcp140*.dll",
     "vcruntime140*.dll",
+)
+
+ACCIDENTAL_ICU_PATTERNS = (
+    "icuuc.dll",
+    "icudt*.dll",
+    "icuin*.dll",
 )
 
 
@@ -52,6 +59,42 @@ def synchronize_msvc_runtime(dist_dir: Path) -> list[str]:
         copied.append(source.name)
     return copied
 
+
+def remove_accidental_windows_icu(
+    dist_dir: Path,
+    system_dir: Path | None = None,
+) -> list[str]:
+    """Remove foreign ICU binaries that shadow Windows' ICU implementation.
+
+    Qt 6.11's Windows wheel imports ``icuuc.dll`` from System32 and does not
+    ship its own ICU binaries.  If an unrelated SDK (for example Poppler) is
+    present on PATH, PyInstaller may resolve that SDK's incompatible
+    ``icuuc.dll`` and copy it into ``_internal``.  The app-local DLL wins the
+    Windows loader search and QtCore then fails with WinError 127.
+    """
+    internal_dir = dist_dir / "_internal"
+    qt_bin_dir = internal_dir / "PyQt6" / "Qt6" / "bin"
+    if (qt_bin_dir / "icuuc.dll").is_file():
+        # A future pinned Qt runtime may intentionally ship ICU itself.
+        return []
+
+    if system_dir is None:
+        system_root = os.environ.get("SystemRoot")
+        if not system_root:
+            raise RuntimeError("SystemRoot is not defined; cannot verify Windows ICU.")
+        system_dir = Path(system_root) / "System32"
+    if not (system_dir / "icuuc.dll").is_file():
+        raise RuntimeError(f"Windows ICU runtime not found: {system_dir / 'icuuc.dll'}")
+
+    removed = {}
+    for pattern in ACCIDENTAL_ICU_PATTERNS:
+        for candidate in internal_dir.glob(pattern):
+            if candidate.is_file():
+                removed[candidate.name.casefold()] = candidate
+    for candidate in removed.values():
+        candidate.unlink()
+    return sorted((item.name for item in removed.values()), key=str.casefold)
+
 def run(command):
     print("+", " ".join(map(str, command)))
     subprocess.run(command, cwd=ROOT, check=True)
@@ -72,6 +115,9 @@ def main():
     dist_dir = ROOT / "dist" / "Video_Cutter"
     synchronized = synchronize_msvc_runtime(dist_dir)
     print("+ Synchronized MSVC runtime:", ", ".join(synchronized))
+    removed_icu = remove_accidental_windows_icu(dist_dir)
+    if removed_icu:
+        print("+ Removed accidental app-local ICU:", ", ".join(removed_icu))
     ffmpeg_sys = shutil.which("ffmpeg") or r"C:\ffmpeg\bin\ffmpeg.exe"
     ffprobe_sys = shutil.which("ffprobe") or r"C:\ffmpeg\bin\ffprobe.exe"
 
