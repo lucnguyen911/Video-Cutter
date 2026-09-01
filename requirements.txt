@@ -1,5 +1,7 @@
 altgraph==0.17.5
-PyQt6>=6.6.0
+PyQt6==6.11.0
+PyQt6-Qt6==6.11.1
+PyQt6-sip==13.11.1
 packaging==26.2
 pefile==2024.8.26
 pyinstaller==6.20.0

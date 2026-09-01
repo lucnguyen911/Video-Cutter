@@ -6,7 +6,7 @@
 ; ============================================================
 
 #ifndef MyAppVersion
-#define MyAppVersion "1.0.4"
+#define MyAppVersion "1.0.5"
 #endif
 
 #define MyAppName "Video Cutter"
@@ -41,6 +41,10 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: checkedonce
+
+[InstallDelete]
+; Never mix Python/Qt/MSVC runtime files from two releases.
+Type: filesandordirs; Name: "{app}\_internal"
 
 [Files]
 Source: "dist\Video_Cutter\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
