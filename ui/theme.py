@@ -864,17 +864,23 @@ QPushButton#btn_open_folder {{
 QPushButton#btn_open_folder:hover  {{ background-color: {T["BTN_OPEN_HOVER"]}; color: {T["TEXT_PRIMARY"]}; }}
 QPushButton#btn_open_folder:disabled {{ color: {T["BTN_OPEN_DIS_FG"]}; border-color: {T["BTN_OPEN_DIS_BD"]}; }}
 
-/* ─── Clear log button */
-QPushButton#btn_clear_log {{
-    background-color: {T["BTN_CLEAR_BG"]};
+/* ─── Log action buttons (Xuất log / Xóa log) ─── */
+QPushButton#btn_export_log, QPushButton#btn_clear_log {{
+    background-color: transparent;
     color: {T["TEXT_MUTED"]};
-    border: 1px solid {T["BTN_DEFAULT_BORDER"]};
+    border: none;
     border-radius: 6px;
-    padding: 4px 12px;
-    font-size: 12px;
-    font-weight: 500;
+    padding: 4px 8px;
+    font-size: 13px;
+    font-weight: 600;
 }}
-QPushButton#btn_clear_log:hover {{ background-color: {T["BTN_CLEAR_HOVER"]}; color: {T["TEXT_PRIMARY"]}; }}
+QPushButton#btn_export_log:hover, QPushButton#btn_clear_log:hover {{
+    background-color: {T["BTN_NEUTRAL_HOVER"]};
+    color: {T["TEXT_PRIMARY"]};
+}}
+QPushButton#btn_export_log:pressed, QPushButton#btn_clear_log:pressed {{
+    background-color: {T["BTN_DEFAULT_PRESSED"]};
+}}
 
 /* Browse button */
 QPushButton#btn_browse {{
@@ -1108,6 +1114,11 @@ QLineEdit#DurationInput {{
     max-height: 25px;
     padding: 3px 6px;
     margin-top: 20px;
+}}
+
+QLabel#AppLogo {{
+    background: transparent;
+    border: none;
 }}
 
 QWidget#HeaderPanel {{

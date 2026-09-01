@@ -456,7 +456,7 @@ class UpdateDownloadWorker(QThread):
 
                 content_length = int(response.headers.get("Content-Length", 0))
                 downloaded = 0
-                chunk_size = 65536
+                chunk_size = 1048576 # 1 MB buffer for high throughput
                 sha256_hash = hashlib.sha256()
                 executable_header = bytearray()
 
@@ -510,9 +510,11 @@ class UpdateDownloadWorker(QThread):
 
             final_path = temp_dir / "update_latest.exe"
             if final_path.exists():
-                try: final_path.unlink()
-                except Exception: pass
-            os.rename(part_path, final_path)
+                try:
+                    final_path.unlink()
+                except Exception:
+                    pass
+            os.replace(part_path, final_path)
             self.finished.emit(final_path)
 
         except Exception as e:
@@ -567,6 +569,7 @@ def apply_update(installer_path: Path, target_version: str) -> bool:
         "/SUPPRESSMSGBOXES",
         "/NORESTART",
         "/CLOSEAPPLICATIONS",
+        "/FORCECLOSEAPPLICATIONS",
         f"/DIR={current_app_dir}",
     ]
 
@@ -632,6 +635,57 @@ def run_update_download(update_info: UpdateInfo) -> bool:
     progress.setWindowModality(Qt.WindowModality.ApplicationModal)
     progress.setMinimumDuration(0)
     progress.setValue(0)
+
+    icon_path = Path(__file__).resolve().parent / "icon_scissors.ico"
+    if icon_path.exists():
+        from PyQt6.QtGui import QIcon
+        progress.setWindowIcon(QIcon(str(icon_path)))
+
+    progress.setStyleSheet("""
+        QProgressDialog {
+            background-color: #f8f9fa;
+            color: #212529;
+            font-family: 'Segoe UI', Arial, sans-serif;
+            font-size: 13px;
+        }
+        QLabel {
+            color: #212529;
+            background: transparent;
+            font-size: 13px;
+            font-weight: 500;
+        }
+        QProgressBar {
+            background-color: #e9ecef;
+            color: #212529;
+            border: 1px solid #ced4da;
+            border-radius: 6px;
+            text-align: center;
+            font-size: 12px;
+            font-weight: bold;
+            height: 24px;
+        }
+        QProgressBar::chunk {
+            background-color: #0d6efd;
+            border-radius: 5px;
+        }
+        QPushButton {
+            background-color: #ffffff;
+            color: #212529;
+            border: 1px solid #ced4da;
+            border-radius: 6px;
+            padding: 5px 16px;
+            font-size: 13px;
+            font-weight: 500;
+            min-width: 80px;
+        }
+        QPushButton:hover {
+            background-color: #e9ecef;
+            border-color: #adb5bd;
+        }
+        QPushButton:pressed {
+            background-color: #dee2e6;
+        }
+    """)
     
     worker = UpdateDownloadWorker(
         download_url=update_info.download_url,

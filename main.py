@@ -1,3 +1,4 @@
+import csv
 import math
 import ctypes
 import os
@@ -8,8 +9,10 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 import uuid
 import winsound
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
@@ -21,8 +24,9 @@ from PyQt6.QtWidgets import (
     QFileDialog, QMessageBox, QAbstractItemView, QDialog,
 )
 from PyQt6.QtCore import Qt, QTimer, QUrl, QSize
-from PyQt6.QtGui import QCursor, QIcon, QDragEnterEvent, QDropEvent
+from PyQt6.QtGui import QCursor, QIcon, QPixmap, QDragEnterEvent, QDropEvent
 
+from processing_policy import build_hardware_profile, choose_parallel_video_workers
 from ui.theme import APP_STYLESHEET, build_stylesheet, _DARK_TOKENS, _LIGHT_TOKENS
 
 
@@ -111,7 +115,9 @@ LANG_DATA = {
         "progress_label": "Tiến trình:",
 
         # ── Section 5: Log ──
-        "section_log": "Nhật Ký Xử Lý",
+        "section_log": "⚙  Nhật ký xử lý",
+        "btn_export_log": "💾  Xuất log",
+        "btn_clear_log": "🗑  Xóa log",
 
         # ── Dialogs & Errors ──
         "msg_running": "Tool đang xử lý video.",
@@ -150,6 +156,11 @@ LANG_DATA = {
 
         # ── Log Messages ──
         "log_start": "Bắt đầu xử lý video.",
+        "log_parallel_workers": "Tự tối ưu pipeline: xử lý tối đa {count} video song song.",
+        "log_hardware_profile": "Bộ mã hóa: {encoder}; CPU logic: {cpus}; RAM: {ram:.1f} GB; GPU: {gpu}; worker: {workers}.",
+        "log_parallel_duplicate_names": "Phát hiện tên video trùng nhau; chuyển về xử lý tuần tự để bảo vệ file đầu ra.",
+        "log_video_elapsed": "Hoàn tất {name} trong {seconds:.2f} giây.",
+        "log_batch_elapsed": "Tổng thời gian xử lý batch: {seconds:.2f} giây.",
         "log_input": "Video đầu vào: {path}",
         "log_output_dir": "Thư mục xuất: {path}",
         "log_cut_type": "Kiểu cắt: {type}",
@@ -182,7 +193,8 @@ LANG_DATA = {
         "log_cutting": "Đang cắt video bằng một lệnh FFmpeg segment...",
         "log_segments_done": "FFmpeg đã tạo xong các segment tạm.",
         "log_actual_segments": "Số segment tạm thực tế: {count}",
-        "log_segment_mismatch": "Lưu ý: số segment tạm ({actual}) khác dự kiến ({expected}).",
+        "log_segment_mismatch": "Bố cục segment tạm không khớp ({actual}/{expected}); chuyển sang cắt an toàn theo từng khoảng.",
+        "log_segment_fallback": "Đang cắt lại {count} cảnh bằng mốc thời gian tuyệt đối để tránh lệch/xé cảnh.",
         "log_drop_smooth": "Bỏ segment làm mượt tạm {index}: {name}",
         "log_export_scene": "Xuất cảnh {number:03d} -> {folder}/{file}",
         "log_complete": "HOÀN THÀNH.",
@@ -263,7 +275,9 @@ LANG_DATA = {
         "progress_label": "Progress:",
 
         # ── Section 5: Log ──
-        "section_log": "Process Log",
+        "section_log": "⚙  Process Log",
+        "btn_export_log": "💾  Export log",
+        "btn_clear_log": "🗑  Clear log",
 
         # ── Dialogs & Errors ──
         "msg_running": "Tool is currently processing video.",
@@ -302,6 +316,11 @@ LANG_DATA = {
 
         # ── Log Messages ──
         "log_start": "Starting video processing.",
+        "log_parallel_workers": "Auto-tuned pipeline: processing up to {count} videos in parallel.",
+        "log_hardware_profile": "Encoder: {encoder}; logical CPUs: {cpus}; RAM: {ram:.1f} GB; GPU: {gpu}; workers: {workers}.",
+        "log_parallel_duplicate_names": "Duplicate video names detected; using serial processing to protect output files.",
+        "log_video_elapsed": "Finished {name} in {seconds:.2f} seconds.",
+        "log_batch_elapsed": "Total batch processing time: {seconds:.2f} seconds.",
         "log_input": "Input video: {path}",
         "log_output_dir": "Output dir: {path}",
         "log_cut_type": "Cut type: {type}",
@@ -334,7 +353,8 @@ LANG_DATA = {
         "log_cutting": "Cutting video with FFmpeg segment...",
         "log_segments_done": "FFmpeg finished creating temp segments.",
         "log_actual_segments": "Actual temp segments: {count}",
-        "log_segment_mismatch": "Note: temp segments ({actual}) differ from expected ({expected}).",
+        "log_segment_mismatch": "Temp segment layout differs ({actual}/{expected}); switching to safe interval extraction.",
+        "log_segment_fallback": "Re-cutting {count} scenes from absolute intervals to prevent shifted/torn scenes.",
         "log_drop_smooth": "Dropping smooth segment {index}: {name}",
         "log_export_scene": "Export scene {number:03d} -> {folder}/{file}",
         "log_complete": "COMPLETE.",
@@ -427,22 +447,8 @@ def get_subprocess_creationflags():
 
 
 def detect_hardware_graphics(ffmpeg_path: str) -> str:
-    """Quét toàn diện hệ thống FFmpeg xem đang khả dụng loại card đồ họa nào"""
-    try:
-        import subprocess
-        result = subprocess.run(
-            [ffmpeg_path, "-encoders"],
-            capture_output=True, text=True, encoding="utf-8", errors="ignore",
-            creationflags=get_subprocess_creationflags()
-        )
-        encoders_output = result.stdout
-        if "h264_nvenc" in encoders_output:
-            return "nvidia"
-        elif "h264_amf" in encoders_output:
-            return "amd"
-        return "cpu"
-    except Exception:
-        return "cpu"
+    """Compatibility wrapper that verifies a real encoder, not only its name."""
+    return build_hardware_profile(ffmpeg_path, calibrate=False).hardware_type
 
 
 def parse_ffmpeg_time(value: str) -> float | None:
@@ -609,6 +615,135 @@ def normalize_split_times(split_times: list[float], duration: float) -> list[flo
     }
 
     return sorted(normalized)
+
+
+def build_segment_intervals(
+    segment_times: list[float],
+    duration: float,
+) -> list[tuple[float, float]]:
+    """Convert ordered cut points into absolute [start, end] intervals."""
+    points = [0.0, *normalize_split_times(segment_times, duration), duration]
+    return [
+        (round(start, 3), round(end, 3))
+        for start, end in zip(points, points[1:])
+        if end - start >= MIN_BOUNDARY_GAP
+    ]
+
+
+def build_kept_intervals(
+    boundary_times: list[float],
+    duration: float,
+) -> list[tuple[float, float]]:
+    """Build the clips retained around symmetric smooth-removal boundaries."""
+    boundaries = normalize_split_times(boundary_times, duration)
+    if len(boundaries) % 2:
+        raise ValueError("Smooth boundary list must contain left/right pairs.")
+
+    intervals = []
+    start = 0.0
+    for index in range(0, len(boundaries), 2):
+        left, right = boundaries[index], boundaries[index + 1]
+        if left <= start or right <= left:
+            raise ValueError("Smooth boundaries overlap or are out of order.")
+        intervals.append((round(start, 3), round(left, 3)))
+        start = right
+    if duration - start >= MIN_BOUNDARY_GAP:
+        intervals.append((round(start, 3), round(duration, 3)))
+    return intervals
+
+
+def _stabilize_boundary_records(
+    records: list[tuple[float, float, float]],
+    duration: float,
+    min_output_seconds: float,
+    max_output_seconds: float,
+) -> list[tuple[float, float, float]]:
+    """Drop a nearby smooth boundary whenever it would create a tiny clip."""
+    stable = list(records)
+    if min_output_seconds <= 0 or duration < min_output_seconds:
+        return stable
+
+    def intervals_for(items):
+        intervals = []
+        start = 0.0
+        for _split, left, right in items:
+            if left > start:
+                intervals.append((start, left))
+            start = right
+        if duration > start:
+            intervals.append((start, duration))
+        return intervals
+
+    while stable:
+        intervals = intervals_for(stable)
+        short_indices = [
+            index
+            for index, (start, end) in enumerate(intervals)
+            if end - start < min_output_seconds - 0.001
+        ]
+        if not short_indices:
+            break
+
+        short_index = min(
+            short_indices,
+            key=lambda index: intervals[index][1] - intervals[index][0],
+        )
+        removable = []
+        if short_index > 0:
+            removable.append(short_index - 1)
+        if short_index < len(stable):
+            removable.append(short_index)
+        if not removable:
+            break
+
+        def removal_score(remove_index):
+            candidate = stable[:remove_index] + stable[remove_index + 1:]
+            candidate_intervals = intervals_for(candidate)
+            durations = [end - start for start, end in candidate_intervals]
+            remaining_short = sum(
+                value < min_output_seconds - 0.001 for value in durations
+            )
+            overshoot = sum(
+                max(0.0, value - max_output_seconds)
+                for value in durations
+            ) if max_output_seconds > 0 else 0.0
+            return remaining_short, round(overshoot, 3), max(durations, default=duration)
+
+        remove_index = min(removable, key=removal_score)
+        stable.pop(remove_index)
+
+    return stable
+
+
+def read_segment_timeline(segment_list_path: Path) -> list[tuple[float, float]]:
+    """Read FFmpeg's segment CSV without probing hundreds of files individually."""
+    intervals = []
+    try:
+        with segment_list_path.open("r", encoding="utf-8-sig", newline="") as handle:
+            for row in csv.reader(handle):
+                if len(row) < 3:
+                    continue
+                start, end = float(row[-2]), float(row[-1])
+                intervals.append((start, end))
+    except (OSError, ValueError):
+        return []
+    return intervals
+
+
+def segment_layout_matches(
+    actual_intervals: list[tuple[float, float]],
+    expected_intervals: list[tuple[float, float]],
+    tolerance: float = 0.20,
+) -> bool:
+    """Detect a missing/merged timestamp boundary before parity can shift."""
+    if len(actual_intervals) != len(expected_intervals):
+        return False
+    for actual, expected in zip(actual_intervals, expected_intervals):
+        actual_duration = actual[1] - actual[0]
+        expected_duration = expected[1] - expected[0]
+        if actual_duration <= 0 or abs(actual_duration - expected_duration) > tolerance:
+            return False
+    return True
 
 
 def detect_scene_changes(
@@ -911,7 +1046,7 @@ def build_scene_split_times(
             # Tail cần ít nhất min_seconds + smooth_seconds (raw)
             # → split tối đa = duration - min_seconds - smooth_seconds
             ideal_max_split = duration - min_seconds - smooth_seconds
-            if ideal_max_split > min_cut_time:
+            if ideal_max_split >= min_cut_time:
                 ideal_max_split = min(ideal_max_split, effective_max)
                 earlier_candidates = [
                     st for st in scene_times
@@ -927,7 +1062,24 @@ def build_scene_split_times(
         start_time = split_time
         is_first_segment = False
 
-    return normalize_split_times(split_times, duration)
+    normalized_splits = normalize_split_times(split_times, duration)
+    nominal_records = [
+        (
+            split_time,
+            round(split_time - smooth_seconds, 3),
+            round(split_time + smooth_seconds, 3),
+        )
+        for split_time in normalized_splits
+        if split_time - smooth_seconds > 0
+        and split_time + smooth_seconds < duration
+    ]
+    stable_records = _stabilize_boundary_records(
+        nominal_records,
+        duration,
+        min_seconds,
+        max_seconds,
+    )
+    return [record[0] for record in stable_records]
 
 
 def build_smooth_boundary_times(
@@ -1022,14 +1174,11 @@ def build_smooth_boundary_times(
         kept_after_nominal = round(next_nominal_left - nominal_right, 3)
 
         # Nếu adjusted boundary vi phạm min_output ở BẤT KỲ phía nào → fallback.
-        # Lưu ý: Chỉ kiểm tra kept_after cho các split NỘI BỘ (không phải split cuối),
-        # vì phân đoạn cuối cùng bị giới hạn bởi thời lượng video, không thể điều chỉnh.
-        is_last_split = (split_idx + 1 >= len(normalized_splits))
         use_adjusted = True
         if min_output_seconds > 0:
             if kept_before_adjusted < min_output_seconds:
                 use_adjusted = False
-            if not is_last_split and kept_after_adjusted < min_output_seconds:
+            if kept_after_adjusted < min_output_seconds:
                 use_adjusted = False
 
         adjusted_valid = (
@@ -1053,11 +1202,11 @@ def build_smooth_boundary_times(
                 round(nominal_right - nominal_left, 3) >= MIN_BOUNDARY_GAP and
                 round(nominal_left - last_boundary_right, 3) >= MIN_BOUNDARY_GAP
             )
-            # Kiểm tra min_output với nominal (bỏ qua kept_after cho split cuối)
+            # Kiểm tra min_output với nominal ở cả hai phía, kể cả đuôi video.
             if min_output_seconds > 0 and nominal_valid:
                 if kept_before_nominal < min_output_seconds:
                     nominal_valid = False
-                if not is_last_split and kept_after_nominal < min_output_seconds:
+                if kept_after_nominal < min_output_seconds:
                     nominal_valid = False
 
             if nominal_valid:
@@ -1070,7 +1219,18 @@ def build_smooth_boundary_times(
         examples.append((split_time, left, right))
         last_boundary_right = right
 
-    return normalize_split_times(boundary_times, duration), examples
+    stable_examples = _stabilize_boundary_records(
+        examples,
+        duration,
+        min_output_seconds,
+        0.0,
+    )
+    stable_boundaries = [
+        value
+        for _split, left, right in stable_examples
+        for value in (left, right)
+    ]
+    return normalize_split_times(stable_boundaries, duration), stable_examples
 
 
 def format_split_times(split_times: list[float]) -> str:
@@ -1120,6 +1280,7 @@ class VideoCutterApp(QMainWindow):
         self.worker_thread = None
         self.cancel_event = threading.Event()
         self.current_process = None
+        self.current_processes = set()
         self.process_lock = threading.Lock()
         self.current_output_dir = None
         self.last_output_dir = None
@@ -1351,7 +1512,35 @@ class VideoCutterApp(QMainWindow):
         header_layout.setContentsMargins(0, 0, 0, 0)
         header_layout.setSpacing(8)
 
-        # ── Left: Title + Subtitle ──
+        # ── Left: Logo + Title/Subtitle ──
+        header_left_layout = QHBoxLayout()
+        header_left_layout.setContentsMargins(0, 0, 0, 0)
+        header_left_layout.setSpacing(12)
+
+        # App Logo Widget
+        self.logo_label = QLabel()
+        self.logo_label.setObjectName("AppLogo")
+        logo_path = resource_path("scissors.png")
+        if not logo_path.exists():
+            logo_path = resource_path("icon_scissors.ico")
+
+        if logo_path.exists():
+            if logo_path.suffix.lower() == ".ico":
+                pix = QIcon(str(logo_path)).pixmap(128, 128)
+            else:
+                pix = QPixmap(str(logo_path))
+
+            if not pix.isNull():
+                scaled_pix = pix.scaled(
+                    44, 44,
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation
+                )
+                self.logo_label.setPixmap(scaled_pix)
+                self.logo_label.setFixedSize(44, 44)
+                self.logo_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                header_left_layout.addWidget(self.logo_label)
+
         title_block = QWidget()
         title_vbox = QVBoxLayout(title_block)
         title_vbox.setContentsMargins(0, 0, 0, 0)
@@ -1379,7 +1568,8 @@ class VideoCutterApp(QMainWindow):
         self.header_divider.setFixedHeight(2)
         title_vbox.addWidget(self.header_divider)
 
-        header_layout.addWidget(title_block)
+        header_left_layout.addWidget(title_block)
+        header_layout.addLayout(header_left_layout)
         header_layout.addStretch()
 
         # ── Right: Language ComboBox ──
@@ -1818,11 +2008,32 @@ class VideoCutterApp(QMainWindow):
         section.setObjectName("SectionPanel")
         section_layout = QVBoxLayout(section)
         section_layout.setContentsMargins(14, 10, 14, 10)
-        section_layout.setSpacing(4)
+        section_layout.setSpacing(6)
+
+        # ── Header bar cho Section Log (Tiêu đề + Nút Xuất/Xóa log) ──
+        log_header_layout = QHBoxLayout()
+        log_header_layout.setContentsMargins(0, 0, 0, 0)
+        log_header_layout.setSpacing(10)
 
         self.section5_label = QLabel(self.t("section_log"))
         self.section5_label.setObjectName("SectionTitle")
-        section_layout.addWidget(self.section5_label)
+        log_header_layout.addWidget(self.section5_label)
+
+        log_header_layout.addStretch()
+
+        self.btn_export_log = QPushButton(self.t("btn_export_log"))
+        self.btn_export_log.setObjectName("btn_export_log")
+        self.btn_export_log.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.btn_export_log.clicked.connect(self.export_log)
+        log_header_layout.addWidget(self.btn_export_log)
+
+        self.btn_clear_log = QPushButton(self.t("btn_clear_log"))
+        self.btn_clear_log.setObjectName("btn_clear_log")
+        self.btn_clear_log.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.btn_clear_log.clicked.connect(self.clear_log)
+        log_header_layout.addWidget(self.btn_clear_log)
+
+        section_layout.addLayout(log_header_layout)
 
         self.log_box = QTextEdit()
         self.log_box.setObjectName("LogConsole")
@@ -1831,6 +2042,44 @@ class VideoCutterApp(QMainWindow):
         section_layout.addWidget(self.log_box, stretch=1)
 
         parent_layout.addWidget(section, stretch=1)
+
+    def clear_log(self):
+        """Xóa toàn bộ log hiển thị."""
+        self.log_box.clear()
+
+    def export_log(self):
+        """Xuất nội dung log ra file text."""
+        log_content = self.log_box.toPlainText()
+        if not log_content.strip():
+            QMessageBox.information(
+                self,
+                self.t("msg_complete_title"),
+                "Không có nội dung nhật ký để xuất." if self.current_lang == "vi" else "No log content to export."
+            )
+            return
+
+        default_filename = f"log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Xuất Nhật Ký Xử Lý" if self.current_lang == "vi" else "Export Process Log",
+            default_filename,
+            "Text Files (*.txt);;All Files (*)"
+        )
+        if file_path:
+            try:
+                with open(file_path, "w", encoding="utf-8") as f:
+                    f.write(log_content)
+                QMessageBox.information(
+                    self,
+                    self.t("msg_complete_title"),
+                    f"Đã xuất log thành công tại:\n{file_path}" if self.current_lang == "vi" else f"Log exported successfully to:\n{file_path}"
+                )
+            except Exception as e:
+                QMessageBox.critical(
+                    self,
+                    self.t("msg_error_title"),
+                    f"Lỗi khi xuất log:\n{e}" if self.current_lang == "vi" else f"Error exporting log:\n{e}"
+                )
 
     # ══════════════════════════════════════════════════════════════════════════
     #  LANGUAGE & THEME
@@ -1970,6 +2219,8 @@ class VideoCutterApp(QMainWindow):
 
         # Section 5 — Log
         self.section5_label.setText(self.t("section_log"))
+        self.btn_export_log.setText(self.t("btn_export_log"))
+        self.btn_clear_log.setText(self.t("btn_clear_log"))
 
         # Refresh table
         self.refresh_file_table()
@@ -2263,17 +2514,26 @@ class VideoCutterApp(QMainWindow):
 
     def set_current_process(self, process):
         with self.process_lock:
-            self.current_process = process
+            self.current_processes = {
+                active_process
+                for active_process in self.current_processes
+                if active_process.poll() is None
+            }
+            if process is not None:
+                self.current_processes.add(process)
+            self.current_process = next(iter(self.current_processes), None)
 
     def terminate_current_process(self):
         with self.process_lock:
-            process = self.current_process
+            processes = list(self.current_processes)
 
-        if process is not None and process.poll() is None:
+        for process in processes:
+            if process.poll() is not None:
+                continue
             try:
                 process.terminate()
             except Exception:
-                return
+                continue
 
     def cancel_processing(self):
         if not (self.worker_thread and self.worker_thread.is_alive()):
@@ -2605,8 +2865,21 @@ class VideoCutterApp(QMainWindow):
             self.log_queue.put(("error", str(e)))
             return
 
-        self.hardware_type = detect_hardware_graphics(ffmpeg_path)
-        self.log(f"Hệ thống phát hiện phần cứng kết xuất: {self.hardware_type.upper()}")
+        self.hardware_profile = build_hardware_profile(
+            ffmpeg_path,
+            calibrate=(cut_type == CUT_BY_SCENE and total > 1),
+        )
+        self.hardware_type = self.hardware_profile.hardware_type
+        gpu_label = self.hardware_profile.gpu_name or "N/A"
+        self.log(
+            self.t("log_hardware_profile").format(
+                encoder=self.hardware_profile.encoder_label,
+                cpus=self.hardware_profile.logical_cpus,
+                ram=self.hardware_profile.ram_gb,
+                gpu=gpu_label,
+                workers=self.hardware_profile.parallel_video_workers,
+            )
+        )
 
         # Determine the project output directory based on project name input
         if not project_name:
@@ -2624,7 +2897,6 @@ class VideoCutterApp(QMainWindow):
         # ── Setup for Merged modes (Mode 1 and Mode 2) ──
         merged_dir = None
         shared_output_folders = None
-        global_scene_counter = 0
         # For Mode 2 (Merge Rename): per-folder sequential counters
         global_folder_counters = None
 
@@ -2644,99 +2916,139 @@ class VideoCutterApp(QMainWindow):
 
         try:
             self.log(self.t("log_start"))
+            batch_started_at = time.perf_counter()
+            normalized_video_names = [
+                safe_filename(Path(file_info["path"]).stem).casefold()
+                for file_info in file_list_copy
+            ]
+            has_duplicate_video_names = (
+                len(normalized_video_names) != len(set(normalized_video_names))
+            )
+            worker_count = choose_parallel_video_workers(
+                self.hardware_type,
+                cut_type == CUT_BY_SCENE,
+                (
+                    output_mode == OUTPUT_MODE_MERGE_RENAME
+                    or has_duplicate_video_names
+                ),
+                total,
+                profile=self.hardware_profile,
+            )
+            if worker_count > 1:
+                self.log(
+                    self.t("log_parallel_workers").format(count=worker_count),
+                )
+            elif has_duplicate_video_names and total > 1:
+                self.log(self.t("log_parallel_duplicate_names"))
 
-            for idx, file_info in enumerate(file_list_copy):
+            progress_values = [0.0] * total
+            progress_lock = threading.Lock()
+
+            def make_progress_callback(video_index):
+                def progress_cb(value):
+                    bounded_value = max(0.0, min(float(value), 1.0))
+                    with progress_lock:
+                        progress_values[video_index] = max(
+                            progress_values[video_index],
+                            bounded_value,
+                        )
+                        overall_progress = sum(progress_values) / total
+                    self.set_progress(overall_progress)
+
+                return progress_cb
+
+            def process_video_task(idx, file_info):
                 self.check_cancelled()
                 video_path = Path(file_info["path"])
-                # Truyền file_info vào process_single_video để tận dụng cache metadata
-
-                if not video_path.exists():
-                    self.log(
-                        self.t("msg_file_not_found").format(name=video_path.name),
-                    )
-                    continue
+                video_started_at = time.perf_counter()
 
                 self.log(self.t("log_batch_progress").format(
                     current=idx + 1, total=total, name=video_path.name,
                 ))
 
-                # Progress callback: maps 0-1 per-video to overall range
-                base_progress = idx / total
-                slice_size = 1.0 / total
-
-                def progress_cb(
-                    value, _base=base_progress, _slice=slice_size,
-                ):
-                    self.set_progress(_base + value * _slice)
-
-                video_idx = idx + 1  # 1-indexed
+                progress_cb = make_progress_callback(idx)
+                video_idx = idx + 1
 
                 if output_mode == OUTPUT_MODE_SPLIT_FOLDER:
-                    # Mode 0: Each video gets its own parent directory inside the project output directory
                     video_name_no_ext = safe_filename(video_path.stem)
                     video_parent_dir = project_output_dir / video_name_no_ext
                     video_parent_dir.mkdir(parents=True, exist_ok=True)
-                    self.current_output_dir = video_parent_dir
-
                     output_folders = self.create_output_folders(
-                        video_parent_dir, output_folder_count,
+                        video_parent_dir,
+                        output_folder_count,
                     )
-
-                    _counter, exported = self.process_single_video(
-                        video_path=video_path,
-                        cut_type=cut_type,
-                        segment_seconds=segment_seconds,
-                        min_seconds=min_seconds,
-                        max_seconds=max_seconds,
-                        scene_threshold=scene_threshold,
-                        remove_audio=remove_audio,
-                        smooth_enabled=smooth_enabled,
-                        smooth_seconds=smooth_seconds,
-                        ffmpeg_path=ffmpeg_path,
-                        ffprobe_path=ffprobe_path,
-                        output_folders=output_folders,
-                        scene_counter_start=0,
-                        output_folder_count=output_folder_count,
-                        progress_callback=progress_cb,
-                        temp_base_dir=video_parent_dir,
-                        export_mode=output_mode,
-                        video_idx=video_idx,
-                        global_folder_counters=None,
-                        file_info=file_info,
-                    )
-                    total_exported += exported
-                    self.last_output_dir = video_parent_dir
-                    self.log(
-                        self.t("log_result_folder").format(
-                            path=video_parent_dir,
-                        ),
-                    )
-
+                    temp_base_dir = video_parent_dir
+                    folder_counters = None
                 else:
-                    # Mode 1 or Mode 2: all videos share the same merged output folders
-                    global_scene_counter, exported = self.process_single_video(
-                        video_path=video_path,
-                        cut_type=cut_type,
-                        segment_seconds=segment_seconds,
-                        min_seconds=min_seconds,
-                        max_seconds=max_seconds,
-                        scene_threshold=scene_threshold,
-                        remove_audio=remove_audio,
-                        smooth_enabled=smooth_enabled,
-                        smooth_seconds=smooth_seconds,
-                        ffmpeg_path=ffmpeg_path,
-                        ffprobe_path=ffprobe_path,
-                        output_folders=shared_output_folders,
-                        scene_counter_start=global_scene_counter,
-                        output_folder_count=output_folder_count,
-                        progress_callback=progress_cb,
-                        temp_base_dir=merged_dir,
-                        export_mode=output_mode,
-                        video_idx=video_idx,
-                        global_folder_counters=global_folder_counters,
-                        file_info=file_info,
-                    )
-                    total_exported += exported
+                    output_folders = shared_output_folders
+                    temp_base_dir = merged_dir
+                    folder_counters = global_folder_counters
+
+                _counter, exported = self.process_single_video(
+                    video_path=video_path,
+                    cut_type=cut_type,
+                    segment_seconds=segment_seconds,
+                    min_seconds=min_seconds,
+                    max_seconds=max_seconds,
+                    scene_threshold=scene_threshold,
+                    remove_audio=remove_audio,
+                    smooth_enabled=smooth_enabled,
+                    smooth_seconds=smooth_seconds,
+                    ffmpeg_path=ffmpeg_path,
+                    ffprobe_path=ffprobe_path,
+                    output_folders=output_folders,
+                    scene_counter_start=0,
+                    output_folder_count=output_folder_count,
+                    progress_callback=progress_cb,
+                    temp_base_dir=temp_base_dir,
+                    export_mode=output_mode,
+                    video_idx=video_idx,
+                    global_folder_counters=folder_counters,
+                    file_info=file_info,
+                )
+                progress_cb(1.0)
+                elapsed = time.perf_counter() - video_started_at
+                self.log(
+                    self.t("log_video_elapsed").format(
+                        name=video_path.name,
+                        seconds=elapsed,
+                    ),
+                )
+                return exported
+
+            futures = []
+            with ThreadPoolExecutor(
+                max_workers=worker_count,
+                thread_name_prefix="video-cutter",
+            ) as executor:
+                for idx, file_info in enumerate(file_list_copy):
+                    self.check_cancelled()
+                    video_path = Path(file_info["path"])
+                    if not video_path.exists():
+                        self.log(
+                            self.t("msg_file_not_found").format(
+                                name=video_path.name,
+                            ),
+                        )
+                        make_progress_callback(idx)(1.0)
+                        continue
+                    futures.append(executor.submit(process_video_task, idx, file_info))
+
+                try:
+                    for future in as_completed(futures):
+                        total_exported += future.result()
+                except Exception:
+                    for pending_future in futures:
+                        pending_future.cancel()
+                    self.terminate_current_process()
+                    raise
+
+            self.log(
+                self.t("log_batch_elapsed").format(
+                    seconds=time.perf_counter() - batch_started_at,
+                ),
+            )
+            self.last_output_dir = project_output_dir
 
             # ── All videos done ──
             self.set_progress(1.0)
@@ -2963,9 +3275,12 @@ class VideoCutterApp(QMainWindow):
                 raise RuntimeError(self.t("log_invalid_duration"))
 
             temp_pattern = temp_dir / "scene_%03d.mp4"
+            segment_list_path = temp_dir / "segments.csv"
             discard_smooth_segments = False
             dropped_smooth_segment_count = 0
             segment_progress_start = 0.05
+            expected_segment_intervals = []
+            planned_output_intervals = []
 
             if cut_type == CUT_FIXED:
                 if segment_seconds is None:
@@ -3079,6 +3394,15 @@ class VideoCutterApp(QMainWindow):
                         self.log(self.t("log_no_boundary"))
 
                 expected_temp_segments = len(segment_times) + 1
+                expected_segment_intervals = build_segment_intervals(
+                    segment_times,
+                    duration,
+                )
+                planned_output_intervals = (
+                    build_kept_intervals(segment_times, duration)
+                    if discard_smooth_segments
+                    else expected_segment_intervals
+                )
                 total_scenes = (
                     sum(
                         1
@@ -3102,6 +3426,7 @@ class VideoCutterApp(QMainWindow):
                     v_width=v_width,
                     v_height=v_height,
                     v_fps=v_fps,
+                    segment_list_path=segment_list_path,
                 )
 
             else:
@@ -3140,16 +3465,77 @@ class VideoCutterApp(QMainWindow):
             self.log(self.t("log_segments_done"))
 
             temp_files = sorted(temp_dir.glob("scene_*.mp4"))
-
-            if not temp_files:
-                raise RuntimeError(self.t("log_no_temp_files"))
-
             self.log(
                 self.t("log_actual_segments").format(count=len(temp_files)),
             )
 
-            if len(temp_files) != expected_temp_segments:
+            needs_safe_fallback = False
+            if cut_type == CUT_BY_SCENE:
+                actual_timeline = read_segment_timeline(segment_list_path)
+                needs_safe_fallback = (
+                    len(temp_files) != expected_temp_segments
+                    or not segment_layout_matches(
+                        actual_timeline,
+                        expected_segment_intervals,
+                    )
+                )
+
+            if needs_safe_fallback:
                 self.log(
+                    self.t("log_segment_mismatch").format(
+                        actual=len(temp_files),
+                        expected=expected_temp_segments,
+                    )
+                )
+                self.log(
+                    self.t("log_segment_fallback").format(
+                        count=len(planned_output_intervals),
+                    )
+                )
+                for temp_file in temp_dir.glob("scene_*.mp4"):
+                    temp_file.unlink(missing_ok=True)
+                segment_list_path.unlink(missing_ok=True)
+
+                for interval_index, (start, end) in enumerate(
+                    planned_output_intervals,
+                    start=1,
+                ):
+                    self.check_cancelled()
+                    output_path = temp_dir / f"scene_{interval_index:03d}.mp4"
+                    interval_command = self.build_scene_interval_command(
+                        ffmpeg_path=ffmpeg_path,
+                        video_path=video_path,
+                        output_path=output_path,
+                        start=start,
+                        end=end,
+                        remove_audio=remove_audio,
+                        hardware_type=self.hardware_type,
+                        v_width=v_width,
+                        v_height=v_height,
+                        v_fps=v_fps,
+                    )
+                    run_ffmpeg_segment(
+                        interval_command,
+                        end - start,
+                        lambda _value: None,
+                        self.cancel_event,
+                        self.set_current_process,
+                    )
+
+                temp_files = sorted(temp_dir.glob("scene_*.mp4"))
+                discard_smooth_segments = False
+                dropped_smooth_segment_count = max(
+                    0,
+                    expected_temp_segments - len(planned_output_intervals),
+                )
+                expected_temp_segments = len(planned_output_intervals)
+                total_scenes = expected_temp_segments
+
+            if not temp_files:
+                raise RuntimeError(self.t("log_no_temp_files"))
+
+            if len(temp_files) != expected_temp_segments:
+                raise RuntimeError(
                     self.t("log_segment_mismatch").format(
                         actual=len(temp_files),
                         expected=expected_temp_segments,
@@ -3353,6 +3739,7 @@ class VideoCutterApp(QMainWindow):
         v_width: int = 0,
         v_height: int = 0,
         v_fps: float = 0.0,
+        segment_list_path: Path | None = None,
     ) -> list[str]:
         # Khởi tạo khung xương lệnh gốc
         command = [
@@ -3417,6 +3804,24 @@ class VideoCutterApp(QMainWindow):
             ]
             if not remove_audio: command += ["-c:a", "copy"]
 
+        elif hardware_type == "intel":
+            command += [
+                "-threads", "auto",
+                "-i", str(video_path),
+                "-map", "0:v:0",
+            ]
+            if remove_audio: command += ["-an"]
+            else: command += ["-map", "0:a?"]
+            command += ["-sn", "-dn"]
+            command += [
+                "-c:v", "h264_qsv",
+                "-preset", "veryfast",
+                "-global_quality", bp["cq"],
+                "-forced_idr", "1",
+                "-g", "60",
+            ]
+            if not remove_audio: command += ["-c:a", "copy"]
+
         else:
             # ── TRƯỜNG HỢP 3: MÁY KHÔNG CÓ GPU HOẶC INTEL (DỰ PHÒNG AN TOÀN CPU) ──
             command += [
@@ -3450,6 +3855,11 @@ class VideoCutterApp(QMainWindow):
             ]
 
         command += ["-f", "segment"]
+        if segment_list_path is not None:
+            command += [
+                "-segment_list", str(segment_list_path),
+                "-segment_list_type", "csv",
+            ]
         if segment_times_text:
             command += [
                 "-segment_times", segment_times_text,
@@ -3465,6 +3875,66 @@ class VideoCutterApp(QMainWindow):
             str(temp_pattern),
         ]
 
+        return command
+
+    def build_scene_interval_command(
+        self,
+        ffmpeg_path: str,
+        video_path: Path,
+        output_path: Path,
+        start: float,
+        end: float,
+        remove_audio: bool,
+        hardware_type: str = "cpu",
+        v_width: int = 0,
+        v_height: int = 0,
+        v_fps: float = 0.0,
+    ) -> list[str]:
+        """Safe fallback: encode one explicit absolute interval."""
+        duration = max(MIN_BOUNDARY_GAP, end - start)
+        bp = self._get_bitrate_params(v_width, v_height, v_fps, hardware_type)
+        command = [
+            ffmpeg_path,
+            "-y",
+            "-progress", "pipe:1",
+            "-nostats",
+            "-ss", f"{start:.3f}",
+            "-i", str(video_path),
+            "-t", f"{duration:.3f}",
+            "-map", "0:v:0",
+        ]
+        if remove_audio:
+            command += ["-an"]
+        else:
+            command += ["-map", "0:a?"]
+        command += ["-sn", "-dn"]
+
+        if hardware_type == "nvidia":
+            command += [
+                "-c:v", "h264_nvenc", "-preset", "p2", "-tune", "hq",
+                "-rc", "vbr", "-cq", bp["cq"], "-b:v", bp["bv"],
+                "-maxrate", bp["maxrate"], "-bufsize", bp["bufsize"],
+            ]
+        elif hardware_type == "amd":
+            command += [
+                "-c:v", "h264_amf", "-rc", "vbr_peak", "-quality", "speed",
+                "-b:v", bp["bv"], "-maxrate", bp["maxrate"],
+            ]
+        elif hardware_type == "intel":
+            command += [
+                "-c:v", "h264_qsv", "-preset", "veryfast",
+                "-global_quality", bp["cq"],
+            ]
+        else:
+            command += ["-c:v", "libx264", "-preset", "superfast", "-crf", "22"]
+
+        if not remove_audio:
+            command += ["-c:a", "aac", "-b:a", "192k"]
+        command += [
+            "-avoid_negative_ts", "make_zero",
+            "-movflags", "+faststart",
+            str(output_path),
+        ]
         return command
 
     def create_output_folders(
