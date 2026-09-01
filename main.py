@@ -730,6 +730,27 @@ def read_segment_timeline(segment_list_path: Path) -> list[tuple[float, float]]:
     return intervals
 
 
+def sorted_segment_files(temp_dir: Path) -> list[Path]:
+    """Sort FFmpeg segment files by their numeric index, including 1000+."""
+    def sort_key(path: Path):
+        match = re.fullmatch(r"scene_(\d+)\.mp4", path.name, flags=re.IGNORECASE)
+        return (int(match.group(1)), path.name.casefold()) if match else (sys.maxsize, path.name.casefold())
+
+    return sorted(temp_dir.glob("scene_*.mp4"), key=sort_key)
+
+
+def intervals_meet_minimum(
+    intervals: list[tuple[float, float]],
+    minimum_seconds: float,
+    tolerance: float = 0.20,
+) -> bool:
+    """Reject a final output plan/timeline containing a visible short clip."""
+    if not intervals:
+        return False
+    floor = max(0.0, minimum_seconds - tolerance)
+    return all(end > start and end - start >= floor for start, end in intervals)
+
+
 def segment_layout_matches(
     actual_intervals: list[tuple[float, float]],
     expected_intervals: list[tuple[float, float]],
@@ -3274,7 +3295,9 @@ class VideoCutterApp(QMainWindow):
             if duration <= 0:
                 raise RuntimeError(self.t("log_invalid_duration"))
 
-            temp_pattern = temp_dir / "scene_%03d.mp4"
+            # Eight digits keep lexical order stable too; numeric sorting below
+            # remains the source of truth for very long videos (1000+ pieces).
+            temp_pattern = temp_dir / "scene_%08d.mp4"
             segment_list_path = temp_dir / "segments.csv"
             discard_smooth_segments = False
             dropped_smooth_segment_count = 0
@@ -3464,7 +3487,7 @@ class VideoCutterApp(QMainWindow):
             progress_callback(0.75)
             self.log(self.t("log_segments_done"))
 
-            temp_files = sorted(temp_dir.glob("scene_*.mp4"))
+            temp_files = sorted_segment_files(temp_dir)
             self.log(
                 self.t("log_actual_segments").format(count=len(temp_files)),
             )
@@ -3472,11 +3495,25 @@ class VideoCutterApp(QMainWindow):
             needs_safe_fallback = False
             if cut_type == CUT_BY_SCENE:
                 actual_timeline = read_segment_timeline(segment_list_path)
+                actual_output_timeline = (
+                    actual_timeline[::2]
+                    if discard_smooth_segments
+                    else actual_timeline
+                )
                 needs_safe_fallback = (
                     len(temp_files) != expected_temp_segments
                     or not segment_layout_matches(
                         actual_timeline,
                         expected_segment_intervals,
+                    )
+                    or not intervals_meet_minimum(
+                        planned_output_intervals,
+                        min_seconds,
+                        tolerance=0.001,
+                    )
+                    or not intervals_meet_minimum(
+                        actual_output_timeline,
+                        min_seconds,
                     )
                 )
 
@@ -3522,7 +3559,7 @@ class VideoCutterApp(QMainWindow):
                         self.set_current_process,
                     )
 
-                temp_files = sorted(temp_dir.glob("scene_*.mp4"))
+                temp_files = sorted_segment_files(temp_dir)
                 discard_smooth_segments = False
                 dropped_smooth_segment_count = max(
                     0,

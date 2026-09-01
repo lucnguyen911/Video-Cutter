@@ -1,6 +1,12 @@
 import unittest
 
-from processing_policy import HardwareProfile, choose_parallel_video_workers
+from unittest.mock import patch
+
+from processing_policy import (
+    HardwareProfile,
+    build_hardware_profile,
+    choose_parallel_video_workers,
+)
 
 
 class ProcessingPolicyTests(unittest.TestCase):
@@ -39,6 +45,25 @@ class ProcessingPolicyTests(unittest.TestCase):
             hardware_type="nvidia",
             parallel_video_workers=3,
         )
+
+    def test_high_end_nvidia_uses_three_workers_without_short_benchmark(self):
+        with (
+            patch(
+                "processing_policy.detect_best_encoder",
+                return_value=("h264_nvenc", "nvidia", "NVIDIA NVENC"),
+            ),
+            patch("processing_policy.os.cpu_count", return_value=20),
+            patch("processing_policy._ram_gb", return_value=32.0),
+            patch(
+                "processing_policy._nvidia_info",
+                return_value=("NVIDIA GeForce RTX 5070 Ti", 16384),
+            ),
+            patch("processing_policy._calibrate_parallel_workers") as calibrate,
+        ):
+            profile = build_hardware_profile("ffmpeg", calibrate=True)
+
+        self.assertEqual(profile.parallel_video_workers, 3)
+        calibrate.assert_not_called()
         self.assertEqual(
             choose_parallel_video_workers(
                 "nvidia", True, False, 3, profile=profile,

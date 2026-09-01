@@ -19,7 +19,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 
-PROFILE_SCHEMA = 1
+PROFILE_SCHEMA = 2
 MAX_PARALLEL_VIDEO_JOBS = 3
 
 
@@ -246,7 +246,19 @@ def build_hardware_profile(ffmpeg_path: str, calibrate: bool = True) -> Hardware
     workers = ceiling
     calibrated = False
 
-    if calibrate and ceiling > 1:
+    is_high_end_nvidia = (
+        hardware_type == "nvidia"
+        and gpu_memory_mb >= 12000
+        and logical_cpus >= 12
+        and ram_gb >= 24
+    )
+
+    if is_high_end_nvidia:
+        # Short synthetic calibration is dominated by FFmpeg process startup and
+        # regularly underestimates multi-stream NVENC cards. The hardware tier
+        # is a more reliable policy for a three-video batch.
+        workers = ceiling
+    elif calibrate and ceiling > 1:
         key = _profile_key(ffmpeg_path, encoder, gpu_name, gpu_memory_mb)
         cached_workers = _load_cached_workers(key)
         if cached_workers is None:

@@ -7,8 +7,10 @@ from main import (
     build_scene_split_times,
     build_segment_intervals,
     build_smooth_boundary_times,
+    intervals_meet_minimum,
     read_segment_timeline,
     segment_layout_matches,
+    sorted_segment_files,
 )
 
 
@@ -69,3 +71,21 @@ def test_segment_csv_accepts_expected_layout(tmp_path: Path):
         read_segment_timeline(csv_path),
         build_segment_intervals([5.0, 6.0], 11.0),
     )
+
+
+def test_segment_files_are_sorted_numerically_past_999(tmp_path: Path):
+    for index in (999, 100, 1001, 101, 1000):
+        (tmp_path / f"scene_{index:03d}.mp4").touch()
+
+    assert [path.name for path in sorted_segment_files(tmp_path)] == [
+        "scene_100.mp4",
+        "scene_101.mp4",
+        "scene_999.mp4",
+        "scene_1000.mp4",
+        "scene_1001.mp4",
+    ]
+
+
+def test_final_timeline_rejects_one_second_smooth_fragments():
+    assert intervals_meet_minimum([(0.0, 3.0), (4.0, 8.0)], 3.0)
+    assert not intervals_meet_minimum([(0.0, 3.0), (3.0, 4.0)], 3.0)

@@ -1,4 +1,4 @@
-# Hướng dẫn Biên dịch & Đóng gói Video Cutter v1.0.6
+# Hướng dẫn Biên dịch & Đóng gói Video Cutter v1.0.7
 
 ## Mục lục
 1. [Chuẩn bị môi trường](#1-chuẩn-bị-môi-trường)
@@ -124,7 +124,7 @@ dist/
 1. Mở **Inno Setup Compiler** (tìm trong Start Menu)
 2. File → Open → chọn file `setup_script.iss` trong thư mục dự án
 3. Nhấn **Ctrl+F9** hoặc Build → Compile để biên dịch
-4. File setup sẽ được tạo tại: `installer_output/Video_Cutter_Setup_v1.0.6.exe`
+4. File setup sẽ được tạo tại: `installer_output/Video_Cutter_Setup_v1.0.7.exe`
 
 ### Cách 2: Dùng dòng lệnh
 
@@ -137,7 +137,7 @@ dist/
 
 ```
 installer_output/
-└── Video_Cutter_Setup_v1.0.6.exe    ← File setup duy nhất (~50-80 MB)
+└── Video_Cutter_Setup_v1.0.7.exe    ← File setup duy nhất (~50-80 MB)
 ```
 
 ---
