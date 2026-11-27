@@ -409,6 +409,24 @@ def safe_filename(name: str) -> str:
     return name
 
 
+def filesystem_path(path: Path, *, recursive: bool = False) -> Path:
+    """Use extended Windows paths for filesystem operations when needed."""
+    if os.name != "nt":
+        return path
+
+    absolute = os.path.abspath(path)
+    if absolute.startswith(("\\\\?\\", "\\\\.\\")):
+        return path
+
+    # Windows counts UTF-16 units and has a lower limit for directory creation.
+    # Recursive cleanup also needs the prefix when only a descendant is long.
+    if not recursive and len(absolute.encode("utf-16-le", "surrogatepass")) < 248 * 2:
+        return path
+    if absolute.startswith("\\\\"):
+        return Path("\\\\?\\UNC\\" + absolute[2:])
+    return Path("\\\\?\\" + absolute)
+
+
 def resource_path(relative_path: str) -> Path:
     """Resolve a resource path for Python and PyInstaller onefile builds."""
     if getattr(sys, "_MEIPASS", None):
@@ -565,7 +583,7 @@ def get_video_properties(video_path: Path, ffprobe_path: str) -> dict:
         "-show_entries",
         "stream=width,height,r_frame_rate,pix_fmt,color_transfer:format=duration",
         "-of", "json",
-        str(video_path),
+        str(filesystem_path(video_path)),
     ]
 
     result = subprocess.run(
@@ -719,7 +737,7 @@ def read_segment_timeline(segment_list_path: Path) -> list[tuple[float, float]]:
     """Read FFmpeg's segment CSV without probing hundreds of files individually."""
     intervals = []
     try:
-        with segment_list_path.open("r", encoding="utf-8-sig", newline="") as handle:
+        with filesystem_path(segment_list_path).open("r", encoding="utf-8-sig", newline="") as handle:
             for row in csv.reader(handle):
                 if len(row) < 3:
                     continue
@@ -736,7 +754,7 @@ def sorted_segment_files(temp_dir: Path) -> list[Path]:
         match = re.fullmatch(r"scene_(\d+)\.mp4", path.name, flags=re.IGNORECASE)
         return (int(match.group(1)), path.name.casefold()) if match else (sys.maxsize, path.name.casefold())
 
-    return sorted(temp_dir.glob("scene_*.mp4"), key=sort_key)
+    return sorted(filesystem_path(temp_dir).glob("scene_*.mp4"), key=sort_key)
 
 
 def intervals_meet_minimum(
@@ -783,7 +801,7 @@ def detect_scene_changes(
         ffmpeg_path,
         "-threads", "auto",
         "-hide_banner",
-        "-i", str(video_path),
+        "-i", str(filesystem_path(video_path)),
         "-filter:v",
         f"fps=10,scale=256:-1,select='gt(scene,{threshold})',showinfo",
         "-an", "-sn", "-dn",
@@ -843,7 +861,7 @@ def detect_scene_scores(
         ffmpeg_path,
         "-threads", "auto",
         "-hide_banner",
-        "-i", str(video_path),
+        "-i", str(filesystem_path(video_path)),
         "-filter:v",
         "fps=10,scale=256:-1,select='gte(scene,0)',metadata=print:key=lavfi.scene_score",
         "-an", "-sn", "-dn",
@@ -2319,11 +2337,12 @@ class VideoCutterApp(QMainWindow):
 
         for url in urls:
             path = Path(url.toLocalFile())
-            if path.is_dir():
+            disk_path = filesystem_path(path)
+            if disk_path.is_dir():
                 for ext in VIDEO_EXTENSIONS:
-                    video_files.extend(path.glob(f"*{ext}"))
-                    video_files.extend(path.glob(f"*{ext.upper()}"))
-            elif path.is_file() and path.suffix.lower() in VIDEO_EXTENSIONS:
+                    video_files.extend(path / item.name for item in disk_path.glob(f"*{ext}"))
+                    video_files.extend(path / item.name for item in disk_path.glob(f"*{ext.upper()}"))
+            elif disk_path.is_file() and path.suffix.lower() in VIDEO_EXTENSIONS:
                 video_files.append(path)
 
         if video_files:
@@ -2363,7 +2382,7 @@ class VideoCutterApp(QMainWindow):
             existing_paths.add(abs_path)
 
             try:
-                size = Path(path).stat().st_size
+                size = filesystem_path(Path(abs_path)).stat().st_size
             except OSError:
                 size = 0
 
@@ -2498,10 +2517,11 @@ class VideoCutterApp(QMainWindow):
             return
 
         folder = Path(folder_path)
+        disk_folder = filesystem_path(folder)
         video_files = []
         for ext in VIDEO_EXTENSIONS:
-            video_files.extend(folder.glob(f"*{ext}"))
-            video_files.extend(folder.glob(f"*{ext.upper()}"))
+            video_files.extend(folder / item.name for item in disk_folder.glob(f"*{ext}"))
+            video_files.extend(folder / item.name for item in disk_folder.glob(f"*{ext.upper()}"))
 
         video_files = sorted(set(video_files))
 
@@ -2583,8 +2603,9 @@ class VideoCutterApp(QMainWindow):
             return
 
         try:
-            if self.current_output_dir.exists():
-                shutil.rmtree(self.current_output_dir, ignore_errors=True)
+            disk_path = filesystem_path(output_dir, recursive=True)
+            if disk_path.exists():
+                shutil.rmtree(disk_path, ignore_errors=True)
                 self.log(self.t("msg_cleanup_done"))
         finally:
             if self.last_output_dir == output_dir:
@@ -2592,7 +2613,7 @@ class VideoCutterApp(QMainWindow):
             self.current_output_dir = None
 
     def open_last_output_dir(self):
-        if self.last_output_dir is None or not self.last_output_dir.exists():
+        if self.last_output_dir is None or not filesystem_path(self.last_output_dir).exists():
             self.log(self.t("msg_no_output_dir"))
             self.open_output_button.setEnabled(False)
             return
@@ -2629,7 +2650,7 @@ class VideoCutterApp(QMainWindow):
                     self.cancel_button.setEnabled(False)
                     if (
                         self.last_output_dir is not None
-                        and self.last_output_dir.exists()
+                        and filesystem_path(self.last_output_dir).exists()
                     ):
                         self.open_output_button.setEnabled(True)
                     msg_box = QMessageBox(self)
@@ -2687,7 +2708,7 @@ class VideoCutterApp(QMainWindow):
             raise ValueError(self.t("msg_no_videos"))
 
         for file_info in self.file_list:
-            if not Path(file_info["path"]).exists():
+            if not filesystem_path(Path(file_info["path"])).exists():
                 raise ValueError(
                     self.t("msg_file_not_found").format(
                         name=Path(file_info["path"]).name,
@@ -2911,31 +2932,27 @@ class VideoCutterApp(QMainWindow):
             safe_project_name = safe_filename(project_name)
             project_output_dir = output_dir / safe_project_name
 
-        project_output_dir.mkdir(parents=True, exist_ok=True)
-        self.current_output_dir = project_output_dir
-        self.last_output_dir = project_output_dir
-
-        # ── Setup for Merged modes (Mode 1 and Mode 2) ──
-        merged_dir = None
-        shared_output_folders = None
-        # For Mode 2 (Merge Rename): per-folder sequential counters
-        global_folder_counters = None
-
-        is_merged = output_mode in (OUTPUT_MODE_MERGE_DEFAULT, OUTPUT_MODE_MERGE_RENAME)
-
-        if is_merged:
-            merged_dir = project_output_dir
-            shared_output_folders = self.create_output_folders(
-                merged_dir, output_folder_count,
-            )
-            self.log(self.t("log_merged_output").format(path=merged_dir))
-
-            if output_mode == OUTPUT_MODE_MERGE_RENAME:
-                global_folder_counters = {k: 0 for k in range(1, output_folder_count + 1)}
-
-        total_exported = 0
-
         try:
+            filesystem_path(project_output_dir).mkdir(parents=True, exist_ok=True)
+            self.current_output_dir = project_output_dir
+            self.last_output_dir = project_output_dir
+
+            merged_dir = None
+            shared_output_folders = None
+            global_folder_counters = None
+            is_merged = output_mode in (OUTPUT_MODE_MERGE_DEFAULT, OUTPUT_MODE_MERGE_RENAME)
+
+            if is_merged:
+                merged_dir = project_output_dir
+                shared_output_folders = self.create_output_folders(
+                    merged_dir, output_folder_count,
+                )
+                self.log(self.t("log_merged_output").format(path=merged_dir))
+
+                if output_mode == OUTPUT_MODE_MERGE_RENAME:
+                    global_folder_counters = {k: 0 for k in range(1, output_folder_count + 1)}
+
+            total_exported = 0
             self.log(self.t("log_start"))
             batch_started_at = time.perf_counter()
             normalized_video_names = [
@@ -2993,7 +3010,7 @@ class VideoCutterApp(QMainWindow):
                 if output_mode == OUTPUT_MODE_SPLIT_FOLDER:
                     video_name_no_ext = safe_filename(video_path.stem)
                     video_parent_dir = project_output_dir / video_name_no_ext
-                    video_parent_dir.mkdir(parents=True, exist_ok=True)
+                    filesystem_path(video_parent_dir).mkdir(parents=True, exist_ok=True)
                     output_folders = self.create_output_folders(
                         video_parent_dir,
                         output_folder_count,
@@ -3045,7 +3062,7 @@ class VideoCutterApp(QMainWindow):
                 for idx, file_info in enumerate(file_list_copy):
                     self.check_cancelled()
                     video_path = Path(file_info["path"])
-                    if not video_path.exists():
+                    if not filesystem_path(video_path).exists():
                         self.log(
                             self.t("msg_file_not_found").format(
                                 name=video_path.name,
@@ -3211,7 +3228,7 @@ class VideoCutterApp(QMainWindow):
                 self.set_current_process,
             )
 
-            if not output_file.exists():
+            if not filesystem_path(output_file).exists():
                 raise RuntimeError(f"FFmpeg did not create snapshot: {output_file.name}")
 
             self.log(
@@ -3275,7 +3292,7 @@ class VideoCutterApp(QMainWindow):
         temp_dir = temp_base_dir / f"temp_video_{video_idx}_{safe_temp_id}"
 
         try:
-            temp_dir.mkdir(parents=True, exist_ok=True)
+            filesystem_path(temp_dir).mkdir(parents=True, exist_ok=True)
             self.check_cancelled()
 
             self.log(self.t("log_input").format(path=video_path))
@@ -3529,9 +3546,9 @@ class VideoCutterApp(QMainWindow):
                         count=len(planned_output_intervals),
                     )
                 )
-                for temp_file in temp_dir.glob("scene_*.mp4"):
-                    temp_file.unlink(missing_ok=True)
-                segment_list_path.unlink(missing_ok=True)
+                for temp_file in sorted_segment_files(temp_dir):
+                    filesystem_path(temp_file).unlink(missing_ok=True)
+                filesystem_path(segment_list_path).unlink(missing_ok=True)
 
                 for interval_index, (start, end) in enumerate(
                     planned_output_intervals,
@@ -3625,6 +3642,7 @@ class VideoCutterApp(QMainWindow):
                     stt_str = str(segment_idx).zfill(3)
                     output_file = target_dir / f"{stt_str}_{video_name_clean}.mp4"
 
+                shutil.move(filesystem_path(temp_file), filesystem_path(output_file))
                 self.log(
                     self.t("log_export_scene").format(
                         number=scene_number,
@@ -3632,8 +3650,6 @@ class VideoCutterApp(QMainWindow):
                         file=output_file.name,
                     )
                 )
-                shutil.move(str(temp_file), str(output_file))
-
                 exported_count += 1
                 progress_callback(
                     0.75 + ((temp_index + 1) / len(temp_files)) * 0.25,
@@ -3659,8 +3675,7 @@ class VideoCutterApp(QMainWindow):
             return scene_counter, exported_count
 
         finally:
-            if temp_dir is not None and temp_dir.exists():
-                shutil.rmtree(temp_dir, ignore_errors=True)
+            shutil.rmtree(filesystem_path(temp_dir, recursive=True), ignore_errors=True)
 
     # ══════════════════════════════════════════════════════════════════════════
     #  FFMPEG COMMAND BUILDERS
@@ -3681,7 +3696,7 @@ class VideoCutterApp(QMainWindow):
             "pipe:1",
             "-nostats",
             "-i",
-            str(video_path),
+            str(filesystem_path(video_path)),
             "-map",
             "0:v:0",
         ]
@@ -3711,7 +3726,7 @@ class VideoCutterApp(QMainWindow):
             "1",
             "-segment_format",
             "mp4",
-            str(temp_pattern),
+            str(filesystem_path(temp_pattern)),
         ]
 
         return command
@@ -3728,13 +3743,13 @@ class VideoCutterApp(QMainWindow):
             "-threads", "auto",
             "-y",
             "-ss", f"{snapshot_time:.3f}",
-            "-i", str(video_path),
+            "-i", str(filesystem_path(video_path)),
             "-map", "0:v:0",
             "-frames:v", "1",
             "-q:v", "2",
             "-progress", "pipe:1",
             "-nostats",
-            str(output_file),
+            str(filesystem_path(output_file)),
         ]
 
     @staticmethod
@@ -3797,7 +3812,7 @@ class VideoCutterApp(QMainWindow):
                 "-hwaccel", "cuda",
                 "-hwaccel_output_format", "cuda",
                 "-threads", "auto",
-                "-i", str(video_path),
+                "-i", str(filesystem_path(video_path)),
                 "-map", "0:v:0",
             ]
             if remove_audio: command += ["-an"]
@@ -3823,7 +3838,7 @@ class VideoCutterApp(QMainWindow):
             # Giải mã bằng phần mềm để đảm bảo tương thích mọi đời card AMD
             command += [
                 "-threads", "auto",
-                "-i", str(video_path),
+                "-i", str(filesystem_path(video_path)),
                 "-map", "0:v:0",
             ]
             if remove_audio: command += ["-an"]
@@ -3844,7 +3859,7 @@ class VideoCutterApp(QMainWindow):
         elif hardware_type == "intel":
             command += [
                 "-threads", "auto",
-                "-i", str(video_path),
+                "-i", str(filesystem_path(video_path)),
                 "-map", "0:v:0",
             ]
             if remove_audio: command += ["-an"]
@@ -3863,7 +3878,7 @@ class VideoCutterApp(QMainWindow):
             # ── TRƯỜNG HỢP 3: MÁY KHÔNG CÓ GPU HOẶC INTEL (DỰ PHÒNG AN TOÀN CPU) ──
             command += [
                 "-threads", "auto",
-                "-i", str(video_path),
+                "-i", str(filesystem_path(video_path)),
                 "-map", "0:v:0",
             ]
             if remove_audio: command += ["-an"]
@@ -3894,7 +3909,7 @@ class VideoCutterApp(QMainWindow):
         command += ["-f", "segment"]
         if segment_list_path is not None:
             command += [
-                "-segment_list", str(segment_list_path),
+                "-segment_list", str(filesystem_path(segment_list_path)),
                 "-segment_list_type", "csv",
             ]
         if segment_times_text:
@@ -3909,7 +3924,7 @@ class VideoCutterApp(QMainWindow):
             "-reset_timestamps", "1",
             "-segment_start_number", "1",
             "-segment_format", "mp4",
-            str(temp_pattern),
+            str(filesystem_path(temp_pattern)),
         ]
 
         return command
@@ -3936,7 +3951,7 @@ class VideoCutterApp(QMainWindow):
             "-progress", "pipe:1",
             "-nostats",
             "-ss", f"{start:.3f}",
-            "-i", str(video_path),
+            "-i", str(filesystem_path(video_path)),
             "-t", f"{duration:.3f}",
             "-map", "0:v:0",
         ]
@@ -3970,7 +3985,7 @@ class VideoCutterApp(QMainWindow):
         command += [
             "-avoid_negative_ts", "make_zero",
             "-movflags", "+faststart",
-            str(output_path),
+            str(filesystem_path(output_path)),
         ]
         return command
 
@@ -3983,7 +3998,7 @@ class VideoCutterApp(QMainWindow):
 
         for folder_index in range(1, output_folder_count + 1):
             folder = project_output_dir / f"folder_{folder_index}"
-            folder.mkdir(parents=True, exist_ok=True)
+            filesystem_path(folder).mkdir(parents=True, exist_ok=True)
             folders.append(folder)
 
         return folders
